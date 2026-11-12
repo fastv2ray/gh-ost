@@ -37,7 +37,7 @@ Please refer to the [docs](doc) for more information. No, really, read the [docs
 
 ## Usage
 
-The [cheatsheet](doc/cheatsheet.md) has it all. You may be interested in invoking `gh-ost` in various modes:
+For online schema changes, see the [cheatsheet](doc/cheatsheet.md). You may be interested in invoking `gh-ost` in various modes:
 
 - a _noop_ migration (merely testing that the migration is valid and good to go)
 - a real migration, utilizing a replica (the migration runs on the master; `gh-ost` figures out identities of servers involved. Required mode if your master uses Statement Based Replication)
@@ -45,7 +45,9 @@ The [cheatsheet](doc/cheatsheet.md) has it all. You may be interested in invokin
 - a real migration on a replica (master untouched)
 - a test migration on a replica, the way for you to build trust with `gh-ost`'s operation.
 
-Our tips:
+`gh-ost` also supports **moving tables across clusters** without a schema change (`--move-tables`); you switch application traffic yourself after cut-over. See the [user guide](doc/move-tables.md) and [design doc](doc/move-tables-design.md).
+
+Our tips for online schema changes:
 
 - [Testing above all](doc/testing-on-replica.md), try out `--test-on-replica` first few times. Better yet, make it continuous. We have multiple replicas where we iterate our entire fleet of production tables, migrating them one by one, checksumming the results, verifying migration is good.
 - For each master migration, first issue a _noop_
@@ -97,7 +99,7 @@ Please see [Coding gh-ost](doc/coding-ghost.md) for a guide to getting started d
 
 `gh-ost` is a Go project; it is built with Go `1.15` and above. To build on your own, use either:
 - [script/build](https://github.com/github/gh-ost/blob/master/script/build) - this is the same build script used by CI hence the authoritative; artifact is `./bin/gh-ost` binary.
-- [build.sh](https://github.com/github/gh-ost/blob/master/build.sh) for building `tar.gz` artifacts in `/tmp/gh-ost`
+- [build.sh](https://github.com/github/gh-ost/blob/master/build.sh) for building the release artifacts (`tar.gz` archives plus `.rpm`/`.deb` packages and a `SHA256SUMS` manifest) in `/tmp/gh-ost-release`
 
 Generally speaking, `master` branch is stable, but only [releases](https://github.com/github/gh-ost/releases) are to be used in production.
 

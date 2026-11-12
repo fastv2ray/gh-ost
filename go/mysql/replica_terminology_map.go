@@ -1,0 +1,55 @@
+package mysql
+
+import (
+	"strings"
+
+	version "github.com/hashicorp/go-version"
+)
+
+const (
+	MysqlVersionCutoff = "8.4"
+)
+
+var MysqlReplicaTermMap = map[string]string{
+	"Seconds_Behind_Master": "Seconds_Behind_Source",
+	"Master_Log_File":       "Source_Log_File",
+	"Master_Host":           "Source_Host",
+	"Master_Port":           "Source_Port",
+	"Exec_Master_Log_Pos":   "Exec_Source_Log_Pos",
+	"Read_Master_Log_Pos":   "Read_Source_Log_Pos",
+	"Relay_Master_Log_File": "Relay_Source_Log_File",
+	"Slave_IO_Running":      "Replica_IO_Running",
+	"Slave_SQL_Running":     "Replica_SQL_Running",
+	"master status":         "binary log status",
+	"slave hosts":           "replicas",
+	"slave status":          "replica status",
+	"slave":                 "replica",
+}
+
+// IsMariaDB reports whether the given server version string identifies a
+// MariaDB server (as opposed to Oracle MySQL). MariaDB reports versions >= 10
+// and differs from MySQL in replica terminology and GTID handling.
+func IsMariaDB(mysqlVersion string) bool {
+	return strings.Contains(strings.ToLower(mysqlVersion), "mariadb")
+}
+
+func ReplicaTermFor(mysqlVersion string, term string) string {
+	// MariaDB reports versions >= 10, which compare greater than the 8.4
+	// cutoff, but it never adopted the new replica/source terminology. Keep
+	// the legacy terms for it.
+	if IsMariaDB(mysqlVersion) {
+		return term
+	}
+
+	vs, err := version.NewVersion(mysqlVersion)
+	if err != nil {
+		// default to returning the same term if we cannot determine the version
+		return term
+	}
+
+	mysqlVersionCutoff, _ := version.NewVersion(MysqlVersionCutoff)
+	if vs.GreaterThanOrEqual(mysqlVersionCutoff) {
+		return MysqlReplicaTermMap[term]
+	}
+	return term
+}

@@ -1,9 +1,11 @@
+//nolint:revive // legacy MySQL wire-protocol constants (OK_HEADER, COM_*, CLIENT_*, MYSQL_TYPE_*, AUTH_*, etc.) are kept verbatim from the upstream protocol for backward compatibility
 package mysql
 
 const (
-	MinProtocolVersion byte   = 10
-	MaxPayloadLen      int    = 1<<24 - 1
-	TimeFormat         string = "2006-01-02 15:04:05"
+	ClassicProtocolVersion byte   = 10
+	XProtocolVersion       byte   = 11
+	MaxPayloadLen          int    = 1<<24 - 1
+	TimeFormat             string = "2006-01-02 15:04:05"
 )
 
 const (
@@ -20,10 +22,15 @@ const (
 const (
 	AUTH_MYSQL_OLD_PASSWORD    = "mysql_old_password"
 	AUTH_NATIVE_PASSWORD       = "mysql_native_password"
+	AUTH_CLEAR_PASSWORD        = "mysql_clear_password"
 	AUTH_CACHING_SHA2_PASSWORD = "caching_sha2_password"
 	AUTH_SHA256_PASSWORD       = "sha256_password"
+	AUTH_MARIADB_ED25519       = "client_ed25519"
 )
 
+// SERVER_STATUS_flags_enum
+// https://dev.mysql.com/doc/dev/mysql-server/latest/mysql__com_8h.html#a1d854e841086925be1883e4d7b4e8cad
+// https://github.com/mysql/mysql-server/blob/500c3117e6f638043c4fea8aacf17d63a8d07de6/include/mysql_com.h#L809-L864
 const (
 	SERVER_STATUS_IN_TRANS             uint16 = 0x0001
 	SERVER_STATUS_AUTOCOMMIT           uint16 = 0x0002
@@ -37,8 +44,11 @@ const (
 	SERVER_STATUS_METADATA_CHANGED     uint16 = 0x0400
 	SERVER_QUERY_WAS_SLOW              uint16 = 0x0800
 	SERVER_PS_OUT_PARAMS               uint16 = 0x1000
+	SERVER_STATUS_IN_TRANS_READONLY    uint16 = 0x2000
+	SERVER_SESSION_STATE_CHANGED       uint16 = 0x4000
 )
 
+// https://github.com/mysql/mysql-server/blob/6b6d3ed3d5c6591b446276184642d7d0504ecc86/include/my_command.h#L48-L103
 const (
 	COM_SLEEP byte = iota
 	COM_QUIT
@@ -72,9 +82,13 @@ const (
 	COM_DAEMON
 	COM_BINLOG_DUMP_GTID
 	COM_RESET_CONNECTION
+	COM_CLONE
+	COM_SUBSCRIBE_GROUP_REPLICATION_STREAM
 )
 
 const (
+	// https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
+
 	CLIENT_LONG_PASSWORD uint32 = 1 << iota
 	CLIENT_FOUND_ROWS
 	CLIENT_LONG_FLAG
@@ -97,7 +111,52 @@ const (
 	CLIENT_PLUGIN_AUTH
 	CLIENT_CONNECT_ATTRS
 	CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+	CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS
+	CLIENT_SESSION_TRACK
+	CLIENT_DEPRECATE_EOF
+	CLIENT_OPTIONAL_RESULTSET_METADATA
+	CLIENT_ZSTD_COMPRESSION_ALGORITHM
+	CLIENT_QUERY_ATTRIBUTES
+	MULTI_FACTOR_AUTHENTICATION
+	CLIENT_CAPABILITY_EXTENSION
+	CLIENT_SSL_VERIFY_SERVER_CERT
+	CLIENT_REMEMBER_OPTIONS
 )
+
+var CapNames = map[uint32]string{
+	CLIENT_LONG_PASSWORD:                  "CLIENT_LONG_PASSWORD",
+	CLIENT_FOUND_ROWS:                     "CLIENT_FOUND_ROWS",
+	CLIENT_LONG_FLAG:                      "CLIENT_LONG_FLAG",
+	CLIENT_CONNECT_WITH_DB:                "CLIENT_CONNECT_WITH_DB",
+	CLIENT_NO_SCHEMA:                      "CLIENT_NO_SCHEMA",
+	CLIENT_COMPRESS:                       "CLIENT_COMPRESS",
+	CLIENT_ODBC:                           "CLIENT_ODBC",
+	CLIENT_LOCAL_FILES:                    "CLIENT_LOCAL_FILES",
+	CLIENT_IGNORE_SPACE:                   "CLIENT_IGNORE_SPACE",
+	CLIENT_PROTOCOL_41:                    "CLIENT_PROTOCOL_41",
+	CLIENT_INTERACTIVE:                    "CLIENT_INTERACTIVE",
+	CLIENT_SSL:                            "CLIENT_SSL",
+	CLIENT_IGNORE_SIGPIPE:                 "CLIENT_IGNORE_SIGPIPE",
+	CLIENT_TRANSACTIONS:                   "CLIENT_TRANSACTIONS",
+	CLIENT_RESERVED:                       "CLIENT_RESERVED",
+	CLIENT_SECURE_CONNECTION:              "CLIENT_SECURE_CONNECTION",
+	CLIENT_MULTI_STATEMENTS:               "CLIENT_MULTI_STATEMENTS",
+	CLIENT_MULTI_RESULTS:                  "CLIENT_MULTI_RESULTS",
+	CLIENT_PS_MULTI_RESULTS:               "CLIENT_PS_MULTI_RESULTS",
+	CLIENT_PLUGIN_AUTH:                    "CLIENT_PLUGIN_AUTH",
+	CLIENT_CONNECT_ATTRS:                  "CLIENT_CONNECT_ATTRS",
+	CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: "CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA",
+	CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS:   "CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS",
+	CLIENT_SESSION_TRACK:                  "CLIENT_SESSION_TRACK",
+	CLIENT_DEPRECATE_EOF:                  "CLIENT_DEPRECATE_EOF",
+	CLIENT_OPTIONAL_RESULTSET_METADATA:    "CLIENT_OPTIONAL_RESULTSET_METADATA",
+	CLIENT_ZSTD_COMPRESSION_ALGORITHM:     "CLIENT_ZSTD_COMPRESSION_ALGORITHM",
+	CLIENT_QUERY_ATTRIBUTES:               "CLIENT_QUERY_ATTRIBUTES",
+	MULTI_FACTOR_AUTHENTICATION:           "MULTI_FACTOR_AUTHENTICATION",
+	CLIENT_CAPABILITY_EXTENSION:           "CLIENT_CAPABILITY_EXTENSION",
+	CLIENT_SSL_VERIFY_SERVER_CERT:         "CLIENT_SSL_VERIFY_SERVER_CERT",
+	CLIENT_REMEMBER_OPTIONS:               "CLIENT_REMEMBER_OPTIONS",
+}
 
 const (
 	MYSQL_TYPE_DECIMAL byte = iota
@@ -118,11 +177,13 @@ const (
 	MYSQL_TYPE_VARCHAR
 	MYSQL_TYPE_BIT
 
-	//mysql 5.6
+	// mysql 5.6
 	MYSQL_TYPE_TIMESTAMP2
 	MYSQL_TYPE_DATETIME2
 	MYSQL_TYPE_TIME2
 )
+
+const MYSQL_TYPE_VECTOR = 0xf2
 
 const (
 	MYSQL_TYPE_JSON byte = iota + 0xf5
@@ -157,13 +218,63 @@ const (
 )
 
 const (
-	DEFAULT_CHARSET               = "utf8"
-	DEFAULT_COLLATION_ID   uint8  = 33
-	DEFAULT_COLLATION_NAME string = "utf8_general_ci"
+	PARAM_UNSIGNED = 128
+)
+
+const (
+	DEFAULT_ADDR                  = "127.0.0.1:3306"
+	DEFAULT_IPV6_ADDR             = "[::1]:3306"
+	DEFAULT_USER                  = "root"
+	DEFAULT_PASSWORD              = ""
+	DEFAULT_FLAVOR                = MySQLFlavor
+	DEFAULT_CHARSET               = "utf8mb4"
+	DEFAULT_COLLATION_ID   uint8  = 255
+	DEFAULT_COLLATION_NAME string = "utf8mb4_0900_ai_ci"
+)
+
+const (
+	DEFAULT_DUMP_EXECUTION_PATH = "mysqldump"
 )
 
 // Like vitess, use flavor for different MySQL versions,
 const (
 	MySQLFlavor   = "mysql"
 	MariaDBFlavor = "mariadb"
+)
+
+const (
+	MYSQL_OPTION_MULTI_STATEMENTS_ON = iota
+	MYSQL_OPTION_MULTI_STATEMENTS_OFF
+)
+
+const (
+	MYSQL_COMPRESS_NONE = iota
+	MYSQL_COMPRESS_ZLIB
+	MYSQL_COMPRESS_ZSTD
+)
+
+// See enum_cursor_type in mysql.h
+const (
+	CURSOR_TYPE_NO_CURSOR     byte = 0x0
+	CURSOR_TYPE_READ_ONLY     byte = 0x1
+	CURSOR_TYPE_FOR_UPDATE    byte = 0x2
+	CURSOR_TYPE_SCROLLABLE    byte = 0x4
+	PARAMETER_COUNT_AVAILABLE byte = 0x8
+)
+
+// See enum_session_state_type in mysql_com.h
+const (
+	SESSION_TRACK_SYSTEM_VARIABLES = iota
+	SESSION_TRACK_SCHEMA
+	SESSION_TRACK_STATE_CHANGE
+	SESSION_TRACK_GTIDS
+	SESSION_TRACK_TRANSACTION_CHARACTERISTICS
+	SESSION_TRACK_TRANSACTION_STATE
+)
+
+type GtidFormat int
+
+const (
+	GtidFormatClassic GtidFormat = iota
+	GtidFormatTagged
 )

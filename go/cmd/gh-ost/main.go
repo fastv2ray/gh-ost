@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,20 +8,41 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"slices"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/logic"
+	"github.com/github/gh-ost/go/metrics"
+	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/log"
 
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
-var AppVersion string
+var AppVersion, GitCommit string
+
+type statsdTagList []string
+
+func (s *statsdTagList) String() string {
+	if s == nil || len(*s) == 0 {
+		return ""
+	}
+	return fmt.Sprint([]string(*s))
+}
+
+func (s *statsdTagList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
 
 // acceptSignals registers for OS signals
 func acceptSignals(migrationContext *base.MigrationContext) {
@@ -56,6 +77,7 @@ func main() {
 	flag.StringVar(&migrationContext.CliMasterPassword, "master-password", "", "MySQL password on master, if different from that on replica. Requires --assume-master-host")
 	flag.StringVar(&migrationContext.ConfigFile, "conf", "", "Config file")
 	askPass := flag.Bool("ask-pass", false, "prompt for MySQL password")
+	charset := flag.String("charset", "utf8mb4,utf8,latin1", "The default charset for the database connection is utf8mb4, utf8, latin1.")
 
 	flag.BoolVar(&migrationContext.UseTLS, "ssl", false, "Enable SSL encrypted connections to MySQL hosts")
 	flag.StringVar(&migrationContext.TLSCACertificate, "ssl-ca", "", "CA certificate in PEM format for TLS connections to MySQL hosts. Requires --ssl")
@@ -66,6 +88,9 @@ func main() {
 	flag.StringVar(&migrationContext.DatabaseName, "database", "", "database name (mandatory)")
 	flag.StringVar(&migrationContext.OriginalTableName, "table", "", "table name (mandatory)")
 	flag.StringVar(&migrationContext.AlterStatement, "alter", "", "alter statement (mandatory)")
+	flag.BoolVar(&migrationContext.AttemptInstantDDL, "attempt-instant-ddl", false, "Attempt to use instant DDL for this migration first")
+	storageEngine := flag.String("storage-engine", "innodb", "Specify table storage engine (default: 'innodb'). When 'rocksdb': the session transaction isolation level is changed from REPEATABLE_READ to READ_COMMITTED.")
+
 	flag.BoolVar(&migrationContext.CountTableRows, "exact-rowcount", false, "actually count table rows as opposed to estimate them (results in more accurate progress estimation)")
 	flag.BoolVar(&migrationContext.ConcurrentCountTableRows, "concurrent-rowcount", true, "(with --exact-rowcount), when true (default): count rows after row-copy begins, concurrently, and adjust row estimate later on; when false: first count rows, then start row copy")
 	flag.BoolVar(&migrationContext.AllowedRunningOnMaster, "allow-on-master", false, "allow this migration to run directly on master. Preferably it would run on a replica")
@@ -77,9 +102,11 @@ func main() {
 	flag.BoolVar(&migrationContext.DiscardForeignKeys, "discard-foreign-keys", false, "DANGER! This flag will migrate a table that has foreign keys and will NOT create foreign keys on the ghost table, thus your altered table will have NO foreign keys. This is useful for intentional dropping of foreign keys")
 	flag.BoolVar(&migrationContext.SkipForeignKeyChecks, "skip-foreign-key-checks", false, "set to 'true' when you know for certain there are no foreign keys on your table, and wish to skip the time it takes for gh-ost to verify that")
 	flag.BoolVar(&migrationContext.SkipStrictMode, "skip-strict-mode", false, "explicitly tell gh-ost binlog applier not to enforce strict sql mode")
+	flag.BoolVar(&migrationContext.AllowZeroInDate, "allow-zero-in-date", false, "explicitly tell gh-ost binlog applier to ignore NO_ZERO_IN_DATE,NO_ZERO_DATE in sql_mode")
 	flag.BoolVar(&migrationContext.AliyunRDS, "aliyun-rds", false, "set to 'true' when you execute on Aliyun RDS.")
 	flag.BoolVar(&migrationContext.GoogleCloudPlatform, "gcp", false, "set to 'true' when you execute on a 1st generation Google Cloud Platform (GCP).")
 	flag.BoolVar(&migrationContext.AzureMySQL, "azure", false, "set to 'true' when you execute on Azure Database on MySQL.")
+	flag.BoolVar(&migrationContext.UseGTIDs, "gtid", false, "(experimental) set to 'true' to use MySQL GTIDs for binlog positioning.")
 
 	executeFlag := flag.Bool("execute", false, "actually execute the alter & migrate the table. Default is noop: do some tests and exit")
 	flag.BoolVar(&migrationContext.TestOnReplica, "test-on-replica", false, "Have the migration run on a replica, not on the master. At the end of migration replication is stopped, and tables are swapped and immediately swap-revert. Replication remains stopped and you can compare the two tables for building trust")
@@ -98,17 +125,20 @@ func main() {
 	flag.BoolVar(&migrationContext.AssumeRBR, "assume-rbr", false, "set to 'true' when you know for certain your server uses 'ROW' binlog_format. gh-ost is unable to tell, event after reading binlog_format, whether the replication process does indeed use 'ROW', and restarts replication to be certain RBR setting is applied. Such operation requires SUPER privileges which you might not have. Setting this flag avoids restarting replication and you can proceed to use gh-ost without SUPER privileges")
 	flag.BoolVar(&migrationContext.CutOverExponentialBackoff, "cut-over-exponential-backoff", false, "Wait exponentially longer intervals between failed cut-over attempts. Wait intervals obey a maximum configurable with 'exponential-backoff-max-interval').")
 	exponentialBackoffMaxInterval := flag.Int64("exponential-backoff-max-interval", 64, "Maximum number of seconds to wait between attempts when performing various operations with exponential backoff.")
-	chunkSize := flag.Int64("chunk-size", 1000, "amount of rows to handle in each iteration (allowed range: 100-100,000)")
-	dmlBatchSize := flag.Int64("dml-batch-size", 10, "batch size for DML events to apply in a single transaction (range 1-100)")
+	chunkSize := flag.Int64("chunk-size", 1000, "amount of rows to handle in each iteration (allowed range: 10-100,000)")
+	dmlBatchSize := flag.Int64("dml-batch-size", 10, "batch size for DML events to apply in a single transaction (range 1-1000)")
 	defaultRetries := flag.Int64("default-retries", 60, "Default number of retries for various operations before panicking")
-	cutOverLockTimeoutSeconds := flag.Int64("cut-over-lock-timeout-seconds", 3, "Max number of seconds to hold locks on tables while attempting to cut-over (retry attempted when lock exceeds timeout)")
+	flag.BoolVar(&migrationContext.PanicOnWarnings, "panic-on-warnings", false, "Panic when SQL warnings are encountered when copying a batch indicating data loss")
+	cutOverLockTimeoutSeconds := flag.Int64("cut-over-lock-timeout-seconds", 3, "Max number of seconds to hold locks on tables while attempting to cut-over (retry attempted when lock exceeds timeout) or attempting instant DDL")
 	niceRatio := flag.Float64("nice-ratio", 0, "force being 'nice', imply sleep time per chunk time; range: [0.0..100.0]. Example values: 0 is aggressive. 1: for every 1ms spent copying rows, sleep additional 1ms (effectively doubling runtime); 0.7: for every 10ms spend in a rowcopy chunk, spend 7ms sleeping immediately after")
 
 	maxLagMillis := flag.Int64("max-lag-millis", 1500, "replication lag at which to throttle operation")
 	replicationLagQuery := flag.String("replication-lag-query", "", "Deprecated. gh-ost uses an internal, subsecond resolution query")
-	throttleControlReplicas := flag.String("throttle-control-replicas", "", "List of replicas on which to check for lag; comma delimited. Example: myhost1.com:3306,myhost2.com,myhost3.com:3307")
+	throttleControlReplicas := flag.String("throttle-control-replicas", "", "List of replicas on which to check for lag; comma delimited. Example: myhost1.com:3306,myhost2.com,myhost3.com:3307. In move-tables mode, these replicas are expected to be in the target cluster. Specified target credentials will be used for the connection.")
 	throttleQuery := flag.String("throttle-query", "", "when given, issued (every second) to check if operation should throttle. Expecting to return zero for no-throttle, >0 for throttle. Query is issued on the migrated server. Make sure this query is lightweight")
 	throttleHTTP := flag.String("throttle-http", "", "when given, gh-ost checks given URL via HEAD request; any response code other than 200 (OK) causes throttling; make sure it has low latency response")
+	flag.Int64Var(&migrationContext.ThrottleHTTPIntervalMillis, "throttle-http-interval-millis", 100, "Number of milliseconds to wait before triggering another HTTP throttle check")
+	flag.Int64Var(&migrationContext.ThrottleHTTPTimeoutMillis, "throttle-http-timeout-millis", 1000, "Number of milliseconds to use as an HTTP throttle check timeout")
 	ignoreHTTPErrors := flag.Bool("ignore-http-errors", false, "ignore HTTP connection errors during throttle check")
 	heartbeatIntervalMillis := flag.Int64("heartbeat-interval-millis", 100, "how frequently would gh-ost inject a heartbeat value")
 	flag.StringVar(&migrationContext.ThrottleFlagFile, "throttle-flag-file", "", "operation pauses when this file exists; hint: use a file that is specific to the table being altered")
@@ -124,13 +154,32 @@ func main() {
 	flag.StringVar(&migrationContext.HooksHintMessage, "hooks-hint", "", "arbitrary message to be injected to hooks via GH_OST_HOOKS_HINT, for your convenience")
 	flag.StringVar(&migrationContext.HooksHintOwner, "hooks-hint-owner", "", "arbitrary name of owner to be injected to hooks via GH_OST_HOOKS_HINT_OWNER, for your convenience")
 	flag.StringVar(&migrationContext.HooksHintToken, "hooks-hint-token", "", "arbitrary token to be injected to hooks via GH_OST_HOOKS_HINT_TOKEN, for your convenience")
+	flag.Int64Var(&migrationContext.HooksStatusIntervalSec, "hooks-status-interval", 60, "how many seconds to wait between calling onStatus hook")
 
 	flag.UintVar(&migrationContext.ReplicaServerId, "replica-server-id", 99999, "server id used by gh-ost process. Default: 99999")
+	flag.BoolVar(&migrationContext.AllowSetupMetadataLockInstruments, "allow-setup-metadata-lock-instruments", false, "Validate rename session hold the MDL of original table before unlock tables in cut-over phase")
+	flag.BoolVar(&migrationContext.SkipMetadataLockCheck, "skip-metadata-lock-check", false, "Skip metadata lock check at cut-over time. The checks require performance_schema.metadata_lock to be enabled")
+	flag.IntVar(&migrationContext.BinlogSyncerMaxReconnectAttempts, "binlogsyncer-max-reconnect-attempts", 0, "when master node fails, the maximum number of binlog synchronization attempts to reconnect. 0 is unlimited")
+
+	flag.BoolVar(&migrationContext.IncludeTriggers, "include-triggers", false, "When true, the triggers (if exist) will be created on the new table")
+	flag.StringVar(&migrationContext.TriggerSuffix, "trigger-suffix", "", "Add a suffix to the trigger name (i.e '_v2'). Requires '--include-triggers'")
+	flag.BoolVar(&migrationContext.RemoveTriggerSuffix, "remove-trigger-suffix-if-exists", false, "Remove given suffix from name of trigger. Requires '--include-triggers' and '--trigger-suffix'")
+	flag.BoolVar(&migrationContext.SkipPortValidation, "skip-port-validation", false, "Skip port validation for MySQL connections")
+	flag.BoolVar(&migrationContext.Checkpoint, "checkpoint", false, "Enable migration checkpoints")
+	flag.Int64Var(&migrationContext.CheckpointIntervalSeconds, "checkpoint-seconds", 300, "The number of seconds between checkpoints")
+	flag.BoolVar(&migrationContext.Resume, "resume", false, "Attempt to resume migration from checkpoint")
+	flag.BoolVar(&migrationContext.Revert, "revert", false, "Attempt to revert completed migration")
+	flag.StringVar(&migrationContext.OldTableName, "old-table", "", "The name of the old table when using --revert, e.g. '_mytable_del'")
+	flag.BoolVar(&migrationContext.AnalyzeGhostTableBeforeCutOver, "analyze-ghost-table-before-cutover", false, "Run ANALYZE TABLE on the ghost table immediately before cut-over; abort the migration (fatal) if the ANALYZE fails, rather than swapping in a table with stale statistics. Opt-in; intended for small, non-partitioned tables that are non-empty at copy. Default false")
 
 	maxLoad := flag.String("max-load", "", "Comma delimited status-name=threshold. e.g: 'Threads_running=100,Threads_connected=500'. When status exceeds threshold, app throttles writes")
 	criticalLoad := flag.String("critical-load", "", "Comma delimited status-name=threshold, same format as --max-load. When status exceeds threshold, app panics and quits")
 	flag.Int64Var(&migrationContext.CriticalLoadIntervalMilliseconds, "critical-load-interval-millis", 0, "When 0, migration immediately bails out upon meeting critical-load. When non-zero, a second check is done after given interval, and migration only bails out if 2nd check still meets critical load")
-	flag.Int64Var(&migrationContext.CriticalLoadHibernateSeconds, "critical-load-hibernate-seconds", 0, "When nonzero, critical-load does not panic and bail out; instead, gh-ost goes into hibernate for the specified duration. It will not read/write anything to from/to any server")
+	flag.Int64Var(&migrationContext.CriticalLoadHibernateSeconds, "critical-load-hibernate-seconds", 0, "When non-zero, critical-load does not panic and bail out; instead, gh-ost goes into hibernation for the specified duration. It will not read/write anything from/to any server")
+	statsdAddr := flag.String("statsd-addr", "", "StatsD endpoint (host:port or unix socket); empty disables StatsD")
+	var statsdTags statsdTagList
+	flag.Var(&statsdTags, "statsd-tags", "global StatsD tags applied to every metric (repeatable), format key:value. Example: --statsd-tags 'env:prod,service:my-service'")
+	runtimeMetricsInterval := flag.Int("runtime-metrics-interval", 10, "Seconds between Go runtime memory/GC gauge samples (requires --statsd-addr); 0 disables")
 	quiet := flag.Bool("quiet", false, "quiet")
 	verbose := flag.Bool("verbose", false, "verbose")
 	debug := flag.Bool("debug", false, "debug mode (very verbose)")
@@ -139,9 +188,27 @@ func main() {
 	version := flag.Bool("version", false, "Print version & exit")
 	checkFlag := flag.Bool("check-flag", false, "Check if another flag exists/supported. This allows for cross-version scripting. Exits with 0 when all additional provided flags exist, nonzero otherwise. You must provide (dummy) values for flags that require a value. Example: gh-ost --check-flag --cut-over-lock-timeout-seconds --nice-ratio 0")
 	flag.StringVar(&migrationContext.ForceTmpTableName, "force-table-names", "", "table name prefix to be used on the temporary tables")
-	flag.CommandLine.SetOutput(os.Stdout)
 
+	// move tables flags
+	moveTables := flag.String("move-tables", "", "Comma delimited list of tables to move. e.g. 'table1,table2,table3'. This is a special mode that allows you to move tables between database clusters. This mode is mutually exclusive with --alter, --table, --test-on-replica, --migrate-on-replica and --revert.")
+	flag.StringVar(&migrationContext.MoveTables.TargetHost, "target-host", "", "Target MySQL hostname for --move-tables mode. Must be specified if --move-tables is specified.")
+	flag.IntVar(&migrationContext.MoveTables.TargetPort, "target-port", 3306, "Target MySQL port for --move-tables mode. Defaults to 3306.")
+	flag.StringVar(&migrationContext.MoveTables.TargetUser, "target-user", "", "Target MySQL username for --move-tables mode. If not provided, uses the same user as the source connection")
+	flag.StringVar(&migrationContext.MoveTables.TargetPass, "target-password", "", "Target MySQL password for --move-tables mode. If not provided, uses the same password as the source connection")
+	flag.StringVar(&migrationContext.MoveTables.TargetDatabase, "target-database", "", "Target MySQL database name for --move-tables mode. If not provided, uses the same database name as the source connection")
+	flag.BoolVar(&migrationContext.MoveTables.AllowOnSourcePrimary, "allow-on-source-primary", false, "allow --move-tables to read (schema, row copy, binlog) from the source cluster's primary. By default gh-ost stops if --host is the primary; prefer pointing --host at a replica to spare the primary the copy load.")
+
+	// unsafe fail points, for integration testing purposes
+	flag.BoolVar(&migrationContext.UnsafeFailPointsEnabled, "unsafe-fail-points-enabled", false, "UNSAFE: Enable fail points for integration testing purposes. Do not use in production.")
+
+	flag.CommandLine.SetOutput(os.Stdout)
 	flag.Parse()
+	cutOverLockTimeoutUserSpecified := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "cut-over-lock-timeout-seconds" {
+			cutOverLockTimeoutUserSpecified = true
+		}
+	})
 
 	if *checkFlag {
 		return
@@ -151,12 +218,15 @@ func main() {
 		flag.PrintDefaults()
 		return
 	}
+
+	if AppVersion == "" {
+		AppVersion = "unversioned"
+	}
+	if GitCommit == "" {
+		GitCommit = "unknown"
+	}
 	if *version {
-		appVersion := AppVersion
-		if appVersion == "" {
-			appVersion = "unversioned"
-		}
-		fmt.Println(appVersion)
+		fmt.Printf("%s (git commit: %s)\n", AppVersion, GitCommit)
 		return
 	}
 
@@ -175,66 +245,183 @@ func main() {
 		migrationContext.Log.SetLevel(log.ERROR)
 	}
 
-	if migrationContext.AlterStatement == "" {
-		log.Fatalf("--alter must be provided and statement must not be empty")
+	if migrationContext.AlterStatement == "" && !migrationContext.Revert && *moveTables == "" {
+		log.Fatal("--alter must be provided and statement must not be empty, or --revert must be used, or --move-tables must be used")
 	}
 	parser := sql.NewParserFromAlterStatement(migrationContext.AlterStatement)
 	migrationContext.AlterStatementOptions = parser.GetAlterStatementOptions()
+
+	if migrationContext.Revert {
+		if migrationContext.Resume {
+			log.Fatal("--revert cannot be used with --resume")
+		}
+		if migrationContext.OldTableName == "" {
+			migrationContext.Log.Fatalf("--revert must be called with --old-table")
+		}
+
+		// options irrelevant to revert mode
+		if migrationContext.AlterStatement != "" {
+			log.Warning("--alter was provided with --revert, it will be ignored")
+		}
+		if migrationContext.AttemptInstantDDL {
+			log.Warning("--attempt-instant-ddl was provided with --revert, it will be ignored")
+		}
+		if migrationContext.IncludeTriggers {
+			log.Warning("--include-triggers was provided with --revert, it will be ignored")
+		}
+		if migrationContext.DiscardForeignKeys {
+			log.Warning("--discard-foreign-keys was provided with --revert, it will be ignored")
+		}
+	}
 
 	if migrationContext.DatabaseName == "" {
 		if parser.HasExplicitSchema() {
 			migrationContext.DatabaseName = parser.GetExplicitSchema()
 		} else {
-			log.Fatalf("--database must be provided and database name must not be empty, or --alter must specify database name")
+			log.Fatal("--database must be provided and database name must not be empty, or --alter must specify database name")
 		}
 	}
-	if migrationContext.OriginalTableName == "" {
+
+	if err := flag.Set("database", url.QueryEscape(migrationContext.DatabaseName)); err != nil {
+		migrationContext.Log.Fatale(err)
+	}
+
+	if migrationContext.OriginalTableName == "" && *moveTables == "" {
 		if parser.HasExplicitTable() {
 			migrationContext.OriginalTableName = parser.GetExplicitTable()
 		} else {
-			log.Fatalf("--table must be provided and table name must not be empty, or --alter must specify table name")
+			log.Fatal("--table must be provided and table name must not be empty, or --alter must specify table name")
 		}
 	}
 	migrationContext.Noop = !(*executeFlag)
 	if migrationContext.AllowedRunningOnMaster && migrationContext.TestOnReplica {
-		migrationContext.Log.Fatalf("--allow-on-master and --test-on-replica are mutually exclusive")
+		migrationContext.Log.Fatal("--allow-on-master and --test-on-replica are mutually exclusive")
 	}
 	if migrationContext.AllowedRunningOnMaster && migrationContext.MigrateOnReplica {
-		migrationContext.Log.Fatalf("--allow-on-master and --migrate-on-replica are mutually exclusive")
+		migrationContext.Log.Fatal("--allow-on-master and --migrate-on-replica are mutually exclusive")
 	}
 	if migrationContext.MigrateOnReplica && migrationContext.TestOnReplica {
-		migrationContext.Log.Fatalf("--migrate-on-replica and --test-on-replica are mutually exclusive")
+		migrationContext.Log.Fatal("--migrate-on-replica and --test-on-replica are mutually exclusive")
 	}
 	if migrationContext.SwitchToRowBinlogFormat && migrationContext.AssumeRBR {
-		migrationContext.Log.Fatalf("--switch-to-rbr and --assume-rbr are mutually exclusive")
+		migrationContext.Log.Fatal("--switch-to-rbr and --assume-rbr are mutually exclusive")
 	}
 	if migrationContext.TestOnReplicaSkipReplicaStop {
 		if !migrationContext.TestOnReplica {
-			migrationContext.Log.Fatalf("--test-on-replica-skip-replica-stop requires --test-on-replica to be enabled")
+			migrationContext.Log.Fatal("--test-on-replica-skip-replica-stop requires --test-on-replica to be enabled")
 		}
 		migrationContext.Log.Warning("--test-on-replica-skip-replica-stop enabled. We will not stop replication before cut-over. Ensure you have a plugin that does this.")
 	}
 	if migrationContext.CliMasterUser != "" && migrationContext.AssumeMasterHostname == "" {
-		migrationContext.Log.Fatalf("--master-user requires --assume-master-host")
+		migrationContext.Log.Fatal("--master-user requires --assume-master-host")
 	}
 	if migrationContext.CliMasterPassword != "" && migrationContext.AssumeMasterHostname == "" {
-		migrationContext.Log.Fatalf("--master-password requires --assume-master-host")
+		migrationContext.Log.Fatal("--master-password requires --assume-master-host")
 	}
 	if migrationContext.TLSCACertificate != "" && !migrationContext.UseTLS {
-		migrationContext.Log.Fatalf("--ssl-ca requires --ssl")
+		migrationContext.Log.Fatal("--ssl-ca requires --ssl")
 	}
 	if migrationContext.TLSCertificate != "" && !migrationContext.UseTLS {
-		migrationContext.Log.Fatalf("--ssl-cert requires --ssl")
+		migrationContext.Log.Fatal("--ssl-cert requires --ssl")
 	}
 	if migrationContext.TLSKey != "" && !migrationContext.UseTLS {
-		migrationContext.Log.Fatalf("--ssl-key requires --ssl")
+		migrationContext.Log.Fatal("--ssl-key requires --ssl")
 	}
 	if migrationContext.TLSAllowInsecure && !migrationContext.UseTLS {
-		migrationContext.Log.Fatalf("--ssl-allow-insecure requires --ssl")
+		migrationContext.Log.Fatal("--ssl-allow-insecure requires --ssl")
 	}
 	if *replicationLagQuery != "" {
 		migrationContext.Log.Warningf("--replication-lag-query is deprecated")
 	}
+	if migrationContext.IncludeTriggers && migrationContext.TriggerSuffix == "" {
+		migrationContext.Log.Fatalf("--trigger-suffix must be used with --include-triggers")
+	}
+	if !migrationContext.IncludeTriggers && migrationContext.TriggerSuffix != "" {
+		migrationContext.Log.Fatalf("--trigger-suffix cannot be be used without --include-triggers")
+	}
+	if migrationContext.TriggerSuffix != "" {
+		regex := regexp.MustCompile(`^[\da-zA-Z_]+$`)
+
+		if !regex.Match([]byte(migrationContext.TriggerSuffix)) {
+			migrationContext.Log.Fatalf("--trigger-suffix must contain only alpha numeric characters and underscore (0-9,a-z,A-Z,_)")
+		}
+	}
+	if *storageEngine == "rocksdb" {
+		migrationContext.Log.Warning("RocksDB storage engine support is experimental")
+	}
+	// ignore low checkpoint intervals in unsafe mode as frequent checkpoints are required to reliably
+	// reduce test duration
+	if migrationContext.CheckpointIntervalSeconds < 10 && !migrationContext.UnsafeFailPointsEnabled {
+		migrationContext.Log.Fatalf("--checkpoint-seconds should be >=10")
+	}
+	if migrationContext.CountTableRows && migrationContext.PanicOnWarnings {
+		migrationContext.Log.Warning("--exact-rowcount with --panic-on-warnings: row counts cannot be exact due to warning detection")
+	}
+
+	if *moveTables != "" {
+		if migrationContext.AlterStatement != "" {
+			log.Fatal("--move-tables is mutually exclusive with --alter")
+		}
+		if migrationContext.OriginalTableName != "" {
+			log.Fatal("--move-tables is mutually exclusive with --table")
+		}
+		if migrationContext.TestOnReplica {
+			log.Fatal("--move-tables is mutually exclusive with --test-on-replica")
+		}
+		if migrationContext.MigrateOnReplica {
+			log.Fatal("--move-tables is mutually exclusive with --migrate-on-replica")
+		}
+		if migrationContext.Revert {
+			log.Fatal("--move-tables is mutually exclusive with --revert")
+		}
+		if migrationContext.TimestampOldTable {
+			log.Fatal("--timestamp-old-table is not supported with --move-tables; existing timestamped runs require manual recovery")
+		}
+		if migrationContext.MoveTables.TargetHost == "" {
+			log.Fatal("--target-host must be specified when using --move-tables")
+		}
+		if migrationContext.PostponeCutOverFlagFile == "" {
+			log.Fatal("--postpone-cut-over-flag-file must be specified when using --move-tables")
+		}
+		if !migrationContext.Checkpoint {
+			log.Infof("--move-tables requires checkpointing; enabling --checkpoint")
+			migrationContext.Checkpoint = true
+		}
+		if !migrationContext.UseGTIDs {
+			log.Infof("--move-tables requires GTID coordinates for cutover drain checks; enabling --gtid")
+			migrationContext.UseGTIDs = true
+		}
+		migrationContext.MoveTables.TableNames = strings.Split(*moveTables, ",")
+		for i := range migrationContext.MoveTables.TableNames {
+			migrationContext.MoveTables.TableNames[i] = strings.TrimSpace(migrationContext.MoveTables.TableNames[i])
+		}
+		migrationContext.MoveTables.TableNames = slices.DeleteFunc(migrationContext.MoveTables.TableNames, func(s string) bool { return s == "" })
+		if len(migrationContext.MoveTables.TableNames) == 0 {
+			log.Fatal("--move-tables requires at least one table")
+		}
+		// Reject duplicate table names: a table listed twice would register two
+		// listeners and two row-copy loops for the same data.
+		seenMoveTables := make(map[string]bool, len(migrationContext.MoveTables.TableNames))
+		for _, tableName := range migrationContext.MoveTables.TableNames {
+			if seenMoveTables[tableName] {
+				log.Fatalf("--move-tables lists table %q more than once", tableName)
+			}
+			seenMoveTables[tableName] = true
+		}
+		if migrationContext.MoveTables.TargetDatabase == "" {
+			migrationContext.MoveTables.TargetDatabase = migrationContext.DatabaseName
+		}
+		if !cutOverLockTimeoutUserSpecified {
+			*cutOverLockTimeoutSeconds = 60
+		}
+		migrationContext.MoveTables.ConnectionConfig = mysql.NewConnectionConfig()
+	}
+
+	if err := migrationContext.SetConnectionConfig(*storageEngine); err != nil {
+		migrationContext.Log.Fatale(err)
+	}
+
+	migrationContext.SetConnectionCharset(*charset)
 
 	switch *cutOver {
 	case "atomic", "default", "":
@@ -257,16 +444,24 @@ func main() {
 		migrationContext.Log.Fatale(err)
 	}
 	if migrationContext.ServeSocketFile == "" {
-		migrationContext.ServeSocketFile = fmt.Sprintf("/tmp/gh-ost.%s.%s.sock", migrationContext.DatabaseName, migrationContext.OriginalTableName)
+		if migrationContext.IsMoveTablesMode() {
+			// OriginalTableName is not set until MoveTables() runs and there is no
+			// single "primary" table, so name the socket from the set-derived run
+			// token (avoids an empty path component like /tmp/gh-ost.test..sock).
+			migrationContext.ServeSocketFile = fmt.Sprintf("/tmp/gh-ost.%s.movetables-%s.sock", migrationContext.DatabaseName, migrationContext.MoveTablesRunToken())
+		} else {
+			migrationContext.ServeSocketFile = fmt.Sprintf("/tmp/gh-ost.%s.%s.sock", migrationContext.DatabaseName, migrationContext.OriginalTableName)
+		}
 	}
 	if *askPass {
 		fmt.Println("Password:")
-		bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+		bytePassword, err := term.ReadPassword(syscall.Stdin)
 		if err != nil {
 			migrationContext.Log.Fatale(err)
 		}
 		migrationContext.CliPassword = string(bytePassword)
 	}
+
 	migrationContext.SetHeartbeatIntervalMilliseconds(*heartbeatIntervalMillis)
 	migrationContext.SetNiceRatio(*niceRatio)
 	migrationContext.SetChunkSize(*chunkSize)
@@ -287,14 +482,33 @@ func main() {
 		migrationContext.Log.Errore(err)
 	}
 
-	log.Infof("starting gh-ost %+v", AppVersion)
+	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
 	acceptSignals(migrationContext)
 
-	migrator := logic.NewMigrator(migrationContext)
-	err := migrator.Migrate()
+	metricsClient, metricsErr := metrics.NewClient(*statsdAddr, []string(statsdTags), "gh_ost.")
+	if metricsErr != nil {
+		log.Fatalf("metrics: %v", metricsErr)
+	}
+	defer func() { _ = metricsClient.Close() }()
+	migrationContext.Metrics = metricsClient
+	metricsClient.Count("startup", 1)
+	if *runtimeMetricsInterval > 0 {
+		metrics.StartGoRuntimeReporter(migrationContext.GetContext(), metricsClient, time.Duration(*runtimeMetricsInterval)*time.Second)
+	}
+
+	migrator := logic.NewMigrator(migrationContext, AppVersion)
+	var err error
+	if migrationContext.Revert {
+		err = migrator.Revert()
+	} else if migrationContext.IsMoveTablesMode() {
+		err = migrator.MoveTables()
+	} else {
+		err = migrator.Migrate()
+	}
+
 	if err != nil {
 		migrator.ExecOnFailureHook()
 		migrationContext.Log.Fatale(err)
 	}
-	fmt.Fprintf(os.Stdout, "# Done\n")
+	fmt.Fprintln(os.Stdout, "# Done")
 }

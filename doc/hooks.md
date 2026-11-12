@@ -49,6 +49,10 @@ The full list of supported hooks is best found in code: [hooks.go](https://githu
 - `gh-ost-on-before-cut-over`
 - `gh-ost-on-success`
 - `gh-ost-on-failure`
+- `gh-ost-on-batch-copy-retry`
+
+For CLI runs, `gh-ost-on-failure` runs when the migration returns an error, even if
+`on-startup` did not run or `on-success` may already have enabled target writes.
 
 ### Context
 
@@ -67,21 +71,86 @@ The following variables are available on all hooks:
 - `GH_OST_COPIED_ROWS` - number of rows copied by `gh-ost`
 - `GH_OST_INSPECTED_LAG` - lag in seconds (floating point) of inspected server
 - `GH_OST_HEARTBEAT_LAG` - lag in seconds (floating point) of heartbeat
+- `GH_OST_BINLOG_WRITER_LAG_SECONDS` - writer lag in seconds (floating point) in `--move-tables` mode (`0` in standard mode)
 - `GH_OST_PROGRESS` - progress pct ([0..100], floating point) of migration
 - `GH_OST_ETA_SECONDS` - estimated duration until migration finishes in seconds
 - `GH_OST_MIGRATED_HOST`
 - `GH_OST_INSPECTED_HOST`
 - `GH_OST_EXECUTING_HOST`
+- `GH_OST_TARGET_HOST` - target/applier hostname
 - `GH_OST_HOOKS_HINT` - copy of `--hooks-hint` value
 - `GH_OST_HOOKS_HINT_OWNER` - copy of `--hooks-hint-owner` value
 - `GH_OST_HOOKS_HINT_TOKEN` - copy of `--hooks-hint-token` value
 - `GH_OST_DRY_RUN` - whether or not the `gh-ost` run is a dry run
+- `GH_OST_REVERT` - whether or not `gh-ost` is running in revert mode
+- `GH_OST_MOVE_TABLES` - whether or not `gh-ost` is running in `--move-tables` mode
+- `GH_OST_TARGET_DATABASE_NAME` - operation target database name
+- `GH_OST_TARGET_TABLE_NAME` - operation target table name (mode-dependent)
 
-The following variable are available on particular hooks:
+The following variables are available on particular hooks:
 
+- `GH_OST_INSTANT_DDL` is only available in `gh-ost-on-success`. The value is `true` if instant DDL was successful, and `false` if it was not.
 - `GH_OST_COMMAND` is only available in `gh-ost-on-interactive-command`
 - `GH_OST_STATUS` is only available in `gh-ost-on-status`
+- `GH_OST_LAST_BATCH_COPY_ERROR` is only available in `gh-ost-on-batch-copy-retry`
+
+#### `--move-tables` mode
+
+When [`--move-tables`](move-tables.md) is enabled (`GH_OST_MOVE_TABLES=true`), these variables are added or change meaning:
+
+- `GH_OST_TABLES` - comma-joined list of moved table names in `--move-tables` order (available on all hooks)
+- `GH_OST_TABLE_NAME`, `GH_OST_GHOST_TABLE_NAME`, `GH_OST_TARGET_TABLE_NAME` - comma-joined list of moved table names
+- `GH_OST_OLD_TABLE_NAME` - comma-joined list of source deletion table names (`_<table>_del`)
+- `GH_OST_TARGET_DATABASE_NAME` - target database name (`--target-database`, defaulting to `--database`)
+- `GH_OST_TARGET_HOST` - target cluster hostname (available on all hooks; `GH_OST_MIGRATED_HOST` also matches it once the applier connection is initialized)
+- `GH_OST_BINLOG_WRITER_LAG_SECONDS` and `GH_OST_HEARTBEAT_LAG` - writer lag in seconds derived from applied binlog event timestamps
+- `GH_OST_DRAIN_GTID` (only in `gh-ost-on-success`) - source GTID position captured immediately after the cut-over `RENAME TABLE` (`@@global.gtid_executed` on MySQL, `@@global.gtid_binlog_pos` on MariaDB), representing the drain target the applier waits for (not the target cluster's replication position)
+
+Review existing OSC hooks before reusing them. Hooks may run more than once across initial and resumed attempts and should be idempotent.
+
+- On `--resume`, `gh-ost-on-startup` runs again; a pre-drain cut-over resume skips row-copy hooks and `gh-ost-on-before-cut-over`.
+- Keep write-enabling and routing in `gh-ost-on-success` synchronous; do not return success while those operations run in the background.
+- Do not blindly roll back in `gh-ost-on-failure`; target writes may already be enabled.
+
+See [cut-over](move-tables.md#cut-over) and [recovery](move-tables.md#cleanup-and-recovery).
 
 ### Examples
 
 See [sample hooks](https://github.com/github/gh-ost/tree/master/resources/hooks-sample), as `bash` implementation samples.
+
+### Embedded usage: registering Go callbacks
+
+When `gh-ost` is consumed as a library (importing `github.com/github/gh-ost/go/logic`), callers can register Go functions for any hook event instead of, or in addition to, the on-disk script contract. Implement the `base.Hooks` interface and assign it to `MigrationContext.Hooks` before calling `logic.NewMigrator`:
+
+```go
+import (
+    "github.com/github/gh-ost/go/base"
+    "github.com/github/gh-ost/go/logic"
+)
+
+const version = "1.1.8"
+
+type myHooks struct{}
+
+func (myHooks) OnSuccess(instantDDL bool) error { return nil }
+func (myHooks) OnFailure() error                { return nil }
+// ... implement the remaining base.Hooks methods.
+
+ctx := base.NewMigrationContext()
+// ... configure ctx (DatabaseName, OriginalTableName, AlterStatement, etc.)
+
+ctx.Hooks = &myHooks{}
+m := logic.NewMigrator(ctx, version)
+err := m.Migrate()
+```
+
+To run shell hooks from `--hooks-path` and Go callbacks together, wrap both in `logic.CompositeHooks`. Each member is invoked in order; the first non-nil error short-circuits, matching the script executor's behavior:
+
+```go
+ctx.Hooks = logic.CompositeHooks{
+    logic.NewHooksExecutor(ctx), // existing scripts under HooksPath
+    &myHooks{},                  // additional Go callbacks
+}
+```
+
+`MigrationContext.Hooks` is opt-in. When it is nil, `NewMigrator` wires the default script executor and behavior is identical to the CLI. Hooks are read once at `NewMigrator` time, so reassigning the field afterwards has no effect on the running migration.

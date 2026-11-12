@@ -5,10 +5,25 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/go-mysql-org/go-mysql/utils"
 	"github.com/pingcap/errors"
-	"github.com/siddontang/go/hack"
 )
 
+type StreamingType int
+
+const (
+	// StreamingNone means there is no streaming
+	StreamingNone StreamingType = iota
+	// StreamingSelect is used with select queries for which each result is
+	// directly returned to the client
+	StreamingSelect
+	// StreamingMultiple is used when multiple queries are given at once
+	// usually in combination with SERVER_MORE_RESULTS_EXISTS flag set
+	StreamingMultiple
+)
+
+// Resultset should be created with NewResultset to avoid nil pointer and reduce
+// GC pressure.
 type Resultset struct {
 	Fields     []*Field
 	FieldNames map[string]int
@@ -17,15 +32,16 @@ type Resultset struct {
 	RawPkg []byte
 
 	RowDatas []RowData
+
+	Streaming     StreamingType
+	StreamingDone bool
 }
 
-var (
-	resultsetPool = sync.Pool{
-		New: func() interface{} {
-			return &Resultset{}
-		},
-	}
-)
+var resultsetPool = sync.Pool{
+	New: func() any {
+		return &Resultset{}
+	},
+}
 
 func NewResultset(fieldsCount int) *Resultset {
 	r := resultsetPool.Get().(*Resultset)
@@ -45,9 +61,7 @@ func (r *Resultset) Reset(fieldsCount int) {
 	r.RowDatas = r.RowDatas[:0]
 
 	if r.FieldNames != nil {
-		for k := range r.FieldNames {
-			delete(r.FieldNames, k)
-		}
+		clear(r.FieldNames)
 	} else {
 		r.FieldNames = make(map[string]int)
 	}
@@ -63,15 +77,17 @@ func (r *Resultset) Reset(fieldsCount int) {
 	}
 }
 
+// RowNumber is returning the number of rows in the [Resultset].
 func (r *Resultset) RowNumber() int {
 	return len(r.Values)
 }
 
+// ColumnNumber is returning the number of fields in the [Resultset].
 func (r *Resultset) ColumnNumber() int {
 	return len(r.Fields)
 }
 
-func (r *Resultset) GetValue(row, column int) (interface{}, error) {
+func (r *Resultset) GetValue(row, column int) (any, error) {
 	if row >= len(r.Values) || row < 0 {
 		return nil, errors.Errorf("invalid row index %d", row)
 	}
@@ -86,17 +102,16 @@ func (r *Resultset) GetValue(row, column int) (interface{}, error) {
 func (r *Resultset) NameIndex(name string) (int, error) {
 	if column, ok := r.FieldNames[name]; ok {
 		return column, nil
-	} else {
-		return 0, errors.Errorf("invalid field name %s", name)
 	}
+	return 0, errors.Errorf("invalid field name %s", name)
 }
 
-func (r *Resultset) GetValueByName(row int, name string) (interface{}, error) {
-	if column, err := r.NameIndex(name); err != nil {
+func (r *Resultset) GetValueByName(row int, name string) (any, error) {
+	column, err := r.NameIndex(name)
+	if err != nil {
 		return nil, errors.Trace(err)
-	} else {
-		return r.GetValue(row, column)
 	}
+	return r.GetValue(row, column)
 }
 
 func (r *Resultset) IsNull(row, column int) (bool, error) {
@@ -109,11 +124,11 @@ func (r *Resultset) IsNull(row, column int) (bool, error) {
 }
 
 func (r *Resultset) IsNullByName(row int, name string) (bool, error) {
-	if column, err := r.NameIndex(name); err != nil {
+	column, err := r.NameIndex(name)
+	if err != nil {
 		return false, err
-	} else {
-		return r.IsNull(row, column)
 	}
+	return r.IsNull(row, column)
 }
 
 func (r *Resultset) GetUint(row, column int) (uint64, error) {
@@ -159,20 +174,53 @@ func (r *Resultset) GetUint(row, column int) (uint64, error) {
 }
 
 func (r *Resultset) GetUintByName(row int, name string) (uint64, error) {
-	if column, err := r.NameIndex(name); err != nil {
+	column, err := r.NameIndex(name)
+	if err != nil {
 		return 0, err
-	} else {
-		return r.GetUint(row, column)
 	}
+	return r.GetUint(row, column)
 }
 
 func (r *Resultset) GetInt(row, column int) (int64, error) {
-	v, err := r.GetUint(row, column)
+	d, err := r.GetValue(row, column)
 	if err != nil {
 		return 0, err
 	}
 
-	return int64(v), nil
+	switch v := d.(type) {
+	case int:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint:
+		return int64(v), nil
+	case uint8:
+		return int64(v), nil
+	case uint16:
+		return int64(v), nil
+	case uint32:
+		return int64(v), nil
+	case uint64:
+		return int64(v), nil
+	case float32:
+		return int64(v), nil
+	case float64:
+		return int64(v), nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(v), 10, 64)
+	case nil:
+		return 0, nil
+	default:
+		return 0, errors.Errorf("data type is %T", v)
+	}
 }
 
 func (r *Resultset) GetIntByName(row int, name string) (int64, error) {
@@ -227,11 +275,11 @@ func (r *Resultset) GetFloat(row, column int) (float64, error) {
 }
 
 func (r *Resultset) GetFloatByName(row int, name string) (float64, error) {
-	if column, err := r.NameIndex(name); err != nil {
+	column, err := r.NameIndex(name)
+	if err != nil {
 		return 0, err
-	} else {
-		return r.GetFloat(row, column)
 	}
+	return r.GetFloat(row, column)
 }
 
 func (r *Resultset) GetString(row, column int) (string, error) {
@@ -244,7 +292,7 @@ func (r *Resultset) GetString(row, column int) (string, error) {
 	case string:
 		return v, nil
 	case []byte:
-		return hack.String(v), nil
+		return utils.ByteSliceToString(v), nil
 	case int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", v), nil
@@ -260,9 +308,9 @@ func (r *Resultset) GetString(row, column int) (string, error) {
 }
 
 func (r *Resultset) GetStringByName(row int, name string) (string, error) {
-	if column, err := r.NameIndex(name); err != nil {
+	column, err := r.NameIndex(name)
+	if err != nil {
 		return "", err
-	} else {
-		return r.GetString(row, column)
 	}
+	return r.GetString(row, column)
 }

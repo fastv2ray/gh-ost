@@ -1,0 +1,45 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - dogsled
+    - durationcheck
+    - errname
+    - errorlint
+    - misspell
+    - nilerr
+    - nilnil
+    - nolintlint
+    - nosprintfhostport
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+  disable:
+    - errcheck
+    - noctx
+    - prealloc
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

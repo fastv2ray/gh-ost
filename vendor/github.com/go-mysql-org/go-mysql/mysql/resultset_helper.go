@@ -1,14 +1,18 @@
 package mysql
 
 import (
+	"bytes"
+	"encoding/binary"
 	"math"
 	"strconv"
+	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/siddontang/go/hack"
+
+	"github.com/go-mysql-org/go-mysql/utils"
 )
 
-func formatTextValue(value interface{}) ([]byte, error) {
+func FormatTextValue(value any) ([]byte, error) {
 	switch v := value.(type) {
 	case int8:
 		return strconv.AppendInt(nil, int64(v), 10), nil
@@ -37,7 +41,9 @@ func formatTextValue(value interface{}) ([]byte, error) {
 	case []byte:
 		return v, nil
 	case string:
-		return hack.Slice(v), nil
+		return utils.StringToByteSlice(v), nil
+	case time.Time:
+		return utils.StringToByteSlice(v.Format(time.DateTime)), nil
 	case nil:
 		return nil, nil
 	default:
@@ -45,7 +51,46 @@ func formatTextValue(value interface{}) ([]byte, error) {
 	}
 }
 
-func formatBinaryValue(value interface{}) ([]byte, error) {
+func toBinaryDateTime(t time.Time) ([]byte, error) {
+	var buf bytes.Buffer
+
+	if t.IsZero() {
+		return nil, nil
+	}
+
+	year, month, day := t.Year(), t.Month(), t.Day()
+	hour, minute, sec := t.Hour(), t.Minute(), t.Second()
+	nanosec := t.Nanosecond()
+
+	if nanosec > 0 {
+		buf.WriteByte(byte(11))
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(year))
+		buf.WriteByte(byte(month))
+		buf.WriteByte(byte(day))
+		buf.WriteByte(byte(hour))
+		buf.WriteByte(byte(minute))
+		buf.WriteByte(byte(sec))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(nanosec/1000))
+	} else if hour > 0 || minute > 0 || sec > 0 {
+		buf.WriteByte(byte(7))
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(year))
+		buf.WriteByte(byte(month))
+		buf.WriteByte(byte(day))
+		buf.WriteByte(byte(hour))
+		buf.WriteByte(byte(minute))
+		buf.WriteByte(byte(sec))
+	} else {
+		buf.WriteByte(byte(4))
+		_ = binary.Write(&buf, binary.LittleEndian, uint16(year))
+		buf.WriteByte(byte(month))
+		buf.WriteByte(byte(day))
+	}
+
+	return buf.Bytes(), nil
+}
+
+// FormatBinaryValue formats a value for binary protocol.
+func FormatBinaryValue(value any) ([]byte, error) {
 	switch v := value.(type) {
 	case int8:
 		return Uint64ToBytes(uint64(v)), nil
@@ -74,13 +119,15 @@ func formatBinaryValue(value interface{}) ([]byte, error) {
 	case []byte:
 		return v, nil
 	case string:
-		return hack.Slice(v), nil
+		return utils.StringToByteSlice(v), nil
+	case time.Time:
+		return toBinaryDateTime(v)
 	default:
 		return nil, errors.Errorf("invalid type %T", value)
 	}
 }
 
-func fieldType(value interface{}) (typ uint8, err error) {
+func fieldType(value any) (typ uint8, err error) {
 	switch value.(type) {
 	case int8, int16, int32, int64, int:
 		typ = MYSQL_TYPE_LONGLONG
@@ -90,15 +137,17 @@ func fieldType(value interface{}) (typ uint8, err error) {
 		typ = MYSQL_TYPE_DOUBLE
 	case string, []byte:
 		typ = MYSQL_TYPE_VAR_STRING
+	case time.Time:
+		typ = MYSQL_TYPE_DATETIME
 	case nil:
 		typ = MYSQL_TYPE_NULL
 	default:
 		err = errors.Errorf("unsupport type %T for resultset", value)
 	}
-	return
+	return typ, err
 }
 
-func formatField(field *Field, value interface{}) error {
+func formatField(field *Field, value any) error {
 	switch value.(type) {
 	case int8, int16, int32, int64, int:
 		field.Charset = 63
@@ -109,7 +158,7 @@ func formatField(field *Field, value interface{}) error {
 	case float32, float64:
 		field.Charset = 63
 		field.Flag = BINARY_FLAG | NOT_NULL_FLAG
-	case string, []byte:
+	case string, []byte, time.Time:
 		field.Charset = 33
 	case nil:
 		field.Charset = 33
@@ -119,16 +168,14 @@ func formatField(field *Field, value interface{}) error {
 	return nil
 }
 
-func BuildSimpleTextResultset(names []string, values [][]interface{}) (*Resultset, error) {
-	r := new(Resultset)
-
-	r.Fields = make([]*Field, len(names))
+func BuildSimpleTextResultset(names []string, values [][]any) (*Resultset, error) {
+	r := NewResultset(len(names))
 
 	var b []byte
 
 	if len(values) == 0 {
 		for i, name := range names {
-			r.Fields[i] = &Field{Name: hack.Slice(name), Charset: 33, Type: MYSQL_TYPE_NULL}
+			r.Fields[i] = &Field{Name: utils.StringToByteSlice(name), Charset: 33, Type: MYSQL_TYPE_NULL}
 		}
 		return r, nil
 	}
@@ -145,7 +192,7 @@ func BuildSimpleTextResultset(names []string, values [][]interface{}) (*Resultse
 				return nil, errors.Trace(err)
 			}
 			if r.Fields[j] == nil {
-				r.Fields[j] = &Field{Name: hack.Slice(names[j]), Type: typ}
+				r.Fields[j] = &Field{Name: utils.StringToByteSlice(names[j]), Type: typ}
 				err = formatField(r.Fields[j], value)
 				if err != nil {
 					return nil, errors.Trace(err)
@@ -165,8 +212,7 @@ func BuildSimpleTextResultset(names []string, values [][]interface{}) (*Resultse
 					return nil, errors.Errorf("row types aren't consistent")
 				}
 			}
-			b, err = formatTextValue(value)
-
+			b, err = FormatTextValue(value)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -185,14 +231,12 @@ func BuildSimpleTextResultset(names []string, values [][]interface{}) (*Resultse
 	return r, nil
 }
 
-func BuildSimpleBinaryResultset(names []string, values [][]interface{}) (*Resultset, error) {
-	r := new(Resultset)
-
-	r.Fields = make([]*Field, len(names))
+func BuildSimpleBinaryResultset(names []string, values [][]any) (*Resultset, error) {
+	r := NewResultset(len(names))
 
 	var b []byte
 
-	bitmapLen := ((len(names) + 7 + 2) >> 3)
+	bitmapLen := (len(names) + 7 + 2) >> 3
 
 	for i, vs := range values {
 		if len(vs) != len(r.Fields) {
@@ -213,19 +257,18 @@ func BuildSimpleBinaryResultset(names []string, values [][]interface{}) (*Result
 			if i == 0 {
 				field := &Field{Type: typ}
 				r.Fields[j] = field
-				field.Name = hack.Slice(names[j])
+				field.Name = utils.StringToByteSlice(names[j])
 
 				if err = formatField(field, value); err != nil {
 					return nil, errors.Trace(err)
 				}
 			}
 			if value == nil {
-				nullBitmap[(i+2)/8] |= (1 << (uint(i+2) % 8))
+				nullBitmap[(j+2)/8] |= 1 << (uint(j+2) % 8)
 				continue
 			}
 
-			b, err = formatBinaryValue(value)
-
+			b, err = FormatBinaryValue(value)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -245,10 +288,9 @@ func BuildSimpleBinaryResultset(names []string, values [][]interface{}) (*Result
 	return r, nil
 }
 
-func BuildSimpleResultset(names []string, values [][]interface{}, binary bool) (*Resultset, error) {
+func BuildSimpleResultset(names []string, values [][]any, binary bool) (*Resultset, error) {
 	if binary {
 		return BuildSimpleBinaryResultset(names, values)
-	} else {
-		return BuildSimpleTextResultset(names, values)
 	}
+	return BuildSimpleTextResultset(names, values)
 }

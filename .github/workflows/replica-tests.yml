@@ -1,24 +1,47 @@
 name: migration tests
+permissions:
+  contents: read
 
 on: [pull_request]
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
+  docker-tests:
+    runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
-        version: [mysql-5.5.62,mysql-5.6.43,mysql-5.7.25,mysql-8.0.16]
+        image: ['mysql:5.7.41','mysql:8.0.41','mysql:8.4.3','percona/percona-server:8.0.41-32','mariadb:10.5.29','mariadb:10.6.27','mariadb:10.11.18','mariadb:11.4.12','mariadb:11.8.8']
+    env:
+      TEST_MYSQL_IMAGE: ${{ matrix.image }}
 
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - name: Set up Go 1.16
-      uses: actions/setup-go@v1
-      with:
-        go-version: 1.16
+      - name: Install sysbench
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sysbench
 
-    - name: migration tests
-      env:
-        TEST_MYSQL_VERSION: ${{ matrix.version }}
-      run:  script/cibuild-gh-ost-replica-tests
+      - name: Setup environment
+        run: script/docker-gh-ost-replica-tests up
+
+      - name: Run tests
+        run: script/docker-gh-ost-replica-tests run
+
+      - name: Set artifact name
+        if: failure()
+        run: |
+          ARTIFACT_NAME=$(echo "${{ matrix.image }}" | tr '/:' '-')
+          echo "ARTIFACT_NAME=test-logs-${ARTIFACT_NAME}" >> $GITHUB_ENV
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: /tmp/gh-ost-test.*
+          retention-days: 7
+
+      - name: Teardown environment
+        if: always()
+        run: script/docker-gh-ost-replica-tests down

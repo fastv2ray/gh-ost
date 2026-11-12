@@ -7,15 +7,28 @@ package logic
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/github/gh-ost/go/base"
+)
+
+var (
+	ErrCPUProfilingBadOption  = errors.New("unrecognized cpu profiling option")
+	ErrCPUProfilingInProgress = errors.New("cpu profiling already in progress")
+	defaultCPUProfileDuration = time.Second * 30
 )
 
 type printStatusFunc func(PrintStatusRule, io.Writer)
@@ -25,11 +38,12 @@ type Server struct {
 	migrationContext *base.MigrationContext
 	unixListener     net.Listener
 	tcpListener      net.Listener
-	hooksExecutor    *HooksExecutor
+	hooksExecutor    base.Hooks
 	printStatus      printStatusFunc
+	isCPUProfiling   int64
 }
 
-func NewServer(migrationContext *base.MigrationContext, hooksExecutor *HooksExecutor, printStatus printStatusFunc) *Server {
+func NewServer(migrationContext *base.MigrationContext, hooksExecutor base.Hooks, printStatus printStatusFunc) *Server {
 	return &Server{
 		migrationContext: migrationContext,
 		hooksExecutor:    hooksExecutor,
@@ -37,66 +51,124 @@ func NewServer(migrationContext *base.MigrationContext, hooksExecutor *HooksExec
 	}
 }
 
-func (this *Server) BindSocketFile() (err error) {
-	if this.migrationContext.ServeSocketFile == "" {
-		return nil
+func (srv *Server) runCPUProfile(args string) (io.Reader, error) {
+	duration := defaultCPUProfileDuration
+
+	var err error
+	var blockProfile, useGzip bool
+	if args != "" {
+		s := strings.Split(args, ",")
+		// a duration string must be the 1st field, if any
+		if duration, err = time.ParseDuration(s[0]); err != nil {
+			return nil, err
+		}
+		for _, arg := range s[1:] {
+			switch arg {
+			case "block", "blocked", "blocking":
+				blockProfile = true
+			case "gzip":
+				useGzip = true
+			default:
+				return nil, ErrCPUProfilingBadOption
+			}
+		}
 	}
-	if this.migrationContext.DropServeSocket && base.FileExists(this.migrationContext.ServeSocketFile) {
-		os.Remove(this.migrationContext.ServeSocketFile)
+
+	if atomic.LoadInt64(&srv.isCPUProfiling) > 0 {
+		return nil, ErrCPUProfilingInProgress
 	}
-	this.unixListener, err = net.Listen("unix", this.migrationContext.ServeSocketFile)
-	if err != nil {
-		return err
+	atomic.StoreInt64(&srv.isCPUProfiling, 1)
+	defer atomic.StoreInt64(&srv.isCPUProfiling, 0)
+
+	var buf bytes.Buffer
+	var writer io.Writer = &buf
+	if blockProfile {
+		runtime.SetBlockProfileRate(1)
+		defer runtime.SetBlockProfileRate(0)
 	}
-	this.migrationContext.Log.Infof("Listening on unix socket file: %s", this.migrationContext.ServeSocketFile)
+	if useGzip {
+		writer = gzip.NewWriter(writer)
+	}
+	if err = pprof.StartCPUProfile(writer); err != nil {
+		return nil, err
+	}
+
+	time.Sleep(duration)
+	pprof.StopCPUProfile()
+	srv.migrationContext.Log.Infof("Captured %d byte runtime/pprof CPU profile (gzip=%v)", buf.Len(), useGzip)
+	return &buf, nil
+}
+
+func (srv *Server) createPostponeCutOverFlagFile(filePath string) (err error) {
+	if !base.FileExists(filePath) {
+		if err := base.TouchFile(filePath); err != nil {
+			return fmt.Errorf("failed to create postpone cut-over flag file %s: %w", filePath, err)
+		}
+		srv.migrationContext.Log.Infof("Created postpone-cut-over-flag-file: %s", filePath)
+	}
 	return nil
 }
 
-func (this *Server) RemoveSocketFile() (err error) {
-	this.migrationContext.Log.Infof("Removing socket file: %s", this.migrationContext.ServeSocketFile)
-	return os.Remove(this.migrationContext.ServeSocketFile)
-}
-
-func (this *Server) BindTCPPort() (err error) {
-	if this.migrationContext.ServeTCPPort == 0 {
+func (srv *Server) BindSocketFile() (err error) {
+	if srv.migrationContext.ServeSocketFile == "" {
 		return nil
 	}
-	this.tcpListener, err = net.Listen("tcp", fmt.Sprintf(":%d", this.migrationContext.ServeTCPPort))
+	if srv.migrationContext.DropServeSocket && base.FileExists(srv.migrationContext.ServeSocketFile) {
+		os.Remove(srv.migrationContext.ServeSocketFile)
+	}
+	srv.unixListener, err = net.Listen("unix", srv.migrationContext.ServeSocketFile)
 	if err != nil {
 		return err
 	}
-	this.migrationContext.Log.Infof("Listening on tcp port: %d", this.migrationContext.ServeTCPPort)
+	srv.migrationContext.Log.Infof("Listening on unix socket file: %s", srv.migrationContext.ServeSocketFile)
+	return nil
+}
+
+func (srv *Server) RemoveSocketFile() (err error) {
+	srv.migrationContext.Log.Infof("Removing socket file: %s", srv.migrationContext.ServeSocketFile)
+	return os.Remove(srv.migrationContext.ServeSocketFile)
+}
+
+func (srv *Server) BindTCPPort() (err error) {
+	if srv.migrationContext.ServeTCPPort == 0 {
+		return nil
+	}
+	srv.tcpListener, err = net.Listen("tcp", fmt.Sprintf(":%d", srv.migrationContext.ServeTCPPort))
+	if err != nil {
+		return err
+	}
+	srv.migrationContext.Log.Infof("Listening on tcp port: %d", srv.migrationContext.ServeTCPPort)
 	return nil
 }
 
 // Serve begins listening & serving on whichever device was configured
-func (this *Server) Serve() (err error) {
+func (srv *Server) Serve() (err error) {
 	go func() {
 		for {
-			conn, err := this.unixListener.Accept()
+			conn, err := srv.unixListener.Accept()
 			if err != nil {
-				this.migrationContext.Log.Errore(err)
+				srv.migrationContext.Log.Errore(err)
 			}
-			go this.handleConnection(conn)
+			go srv.handleConnection(conn)
 		}
 	}()
 	go func() {
-		if this.tcpListener == nil {
+		if srv.tcpListener == nil {
 			return
 		}
 		for {
-			conn, err := this.tcpListener.Accept()
+			conn, err := srv.tcpListener.Accept()
 			if err != nil {
-				this.migrationContext.Log.Errore(err)
+				srv.migrationContext.Log.Errore(err)
 			}
-			go this.handleConnection(conn)
+			go srv.handleConnection(conn)
 		}
 	}()
 
 	return nil
 }
 
-func (this *Server) handleConnection(conn net.Conn) (err error) {
+func (srv *Server) handleConnection(conn net.Conn) (err error) {
 	if conn != nil {
 		defer conn.Close()
 	}
@@ -104,26 +176,51 @@ func (this *Server) handleConnection(conn net.Conn) (err error) {
 	if err != nil {
 		return err
 	}
-	return this.onServerCommand(string(command), bufio.NewWriter(conn))
+	return srv.onServerCommand(string(command), bufio.NewWriter(conn))
 }
 
 // onServerCommand responds to a user's interactive command
-func (this *Server) onServerCommand(command string, writer *bufio.Writer) (err error) {
+func (srv *Server) onServerCommand(command string, writer *bufio.Writer) (err error) {
 	defer writer.Flush()
 
-	printStatusRule, err := this.applyServerCommand(command, writer)
+	printStatusRule, err := srv.applyServerCommand(command, writer)
 	if err == nil {
-		this.printStatus(printStatusRule, writer)
+		srv.printStatus(printStatusRule, writer)
 	} else {
 		fmt.Fprintf(writer, "%s\n", err.Error())
 	}
-	return this.migrationContext.Log.Errore(err)
+	return srv.migrationContext.Log.Errore(err)
+}
+
+// commandArgMatchesMigration reports whether a table-name argument supplied with
+// an interactive command refers to this migration. The argument is optional and
+// acts as a courtesy safety check, so an operator who is connected to the wrong
+// gh-ost socket is rejected. In standard mode it must equal the single migrated
+// table; in move-tables mode it may be any one of the migrated tables.
+func (srv *Server) commandArgMatchesMigration(arg string) bool {
+	if srv.migrationContext.IsMoveTablesMode() {
+		for _, tableName := range srv.migrationContext.MoveTables.TableNames {
+			if arg == tableName {
+				return true
+			}
+		}
+		return false
+	}
+	return arg == srv.migrationContext.OriginalTableName
+}
+
+// migrationTargetDescription returns a human-readable description of the migrated
+// table(s), used in interactive-command messages. In move-tables mode it is the
+// comma-joined list of migrated tables; otherwise the single table name.
+func (srv *Server) migrationTargetDescription() string {
+	if srv.migrationContext.IsMoveTablesMode() {
+		return strings.Join(srv.migrationContext.MoveTables.TableNames, ",")
+	}
+	return srv.migrationContext.OriginalTableName
 }
 
 // applyServerCommand parses and executes commands by user
-func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (printStatusRule PrintStatusRule, err error) {
-	printStatusRule = NoPrintStatusRule
-
+func (srv *Server) applyServerCommand(command string, writer *bufio.Writer) (printStatusRule PrintStatusRule, err error) {
 	tokens := strings.SplitN(command, "=", 2)
 	command = strings.TrimSpace(tokens[0])
 	arg := ""
@@ -134,9 +231,9 @@ func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (pr
 		}
 	}
 	argIsQuestion := (arg == "?")
-	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged\n"
+	throttleHint := "# Note: you may only throttle for as long as your binary logs are not purged"
 
-	if err := this.hooksExecutor.onInteractiveCommand(command); err != nil {
+	if err := srv.hooksExecutor.OnInteractiveCommand(command); err != nil {
 		return NoPrintStatusRule, err
 	}
 
@@ -146,6 +243,7 @@ func (this *Server) applyServerCommand(command string, writer *bufio.Writer) (pr
 			fmt.Fprint(writer, `available commands:
 status                               # Print a detailed status message
 sup                                  # Print a short status message
+cpu-profile=<options>                # Print a base64-encoded runtime/pprof CPU profile using a duration, default: 30s. Comma-separated options 'gzip' and/or 'block' (blocked profile) may follow the profile duration
 coordinates                          # Print the currently inspected coordinates
 applier                              # Print the hostname of the applier
 inspector                            # Print the hostname of the inspector
@@ -161,6 +259,7 @@ throttle-http=<URL>                  # Set a new throttle URL
 throttle-control-replicas=<replicas> # Set a new comma delimited list of throttle control replicas
 throttle                             # Force throttling
 no-throttle                          # End forced throttling (other throttling may still apply)
+postpone-cut-over-flag-file=<path>   # Postpone the cut-over phase, writing a cut over flag file to the given path
 unpostpone                           # Bail out a cut-over postpone; proceed to cut-over
 panic                                # panic and quit without cleanup
 help                                 # This message
@@ -171,66 +270,72 @@ help                                 # This message
 		return ForcePrintStatusOnlyRule, nil
 	case "info", "status":
 		return ForcePrintStatusAndHintRule, nil
+	case "cpu-profile":
+		cpuProfile, err := srv.runCPUProfile(arg)
+		if err == nil {
+			fmt.Fprint(base64.NewEncoder(base64.StdEncoding, writer), cpuProfile)
+		}
+		return NoPrintStatusRule, err
 	case "coordinates":
 		{
 			if argIsQuestion || arg == "" {
-				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetRecentBinlogCoordinates())
+				fmt.Fprintf(writer, "%+v\n", srv.migrationContext.GetRecentBinlogCoordinates())
 				return NoPrintStatusRule, nil
 			}
 			return NoPrintStatusRule, fmt.Errorf("coordinates are read-only")
 		}
 	case "applier":
-		if this.migrationContext.ApplierConnectionConfig != nil && this.migrationContext.ApplierConnectionConfig.ImpliedKey != nil {
+		if srv.migrationContext.ApplierConnectionConfig != nil && srv.migrationContext.ApplierConnectionConfig.ImpliedKey != nil {
 			fmt.Fprintf(writer, "Host: %s, Version: %s\n",
-				this.migrationContext.ApplierConnectionConfig.ImpliedKey.String(),
-				this.migrationContext.ApplierMySQLVersion,
+				srv.migrationContext.ApplierConnectionConfig.ImpliedKey.String(),
+				srv.migrationContext.ApplierMySQLVersion,
 			)
 		}
 		return NoPrintStatusRule, nil
 	case "inspector":
-		if this.migrationContext.InspectorConnectionConfig != nil && this.migrationContext.InspectorConnectionConfig.ImpliedKey != nil {
+		if srv.migrationContext.InspectorConnectionConfig != nil && srv.migrationContext.InspectorConnectionConfig.ImpliedKey != nil {
 			fmt.Fprintf(writer, "Host: %s, Version: %s\n",
-				this.migrationContext.InspectorConnectionConfig.ImpliedKey.String(),
-				this.migrationContext.InspectorMySQLVersion,
+				srv.migrationContext.InspectorConnectionConfig.ImpliedKey.String(),
+				srv.migrationContext.InspectorMySQLVersion,
 			)
 		}
 		return NoPrintStatusRule, nil
 	case "chunk-size":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&this.migrationContext.ChunkSize))
+				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&srv.migrationContext.ChunkSize))
 				return NoPrintStatusRule, nil
 			}
 			if chunkSize, err := strconv.Atoi(arg); err != nil {
 				return NoPrintStatusRule, err
 			} else {
-				this.migrationContext.SetChunkSize(int64(chunkSize))
+				srv.migrationContext.SetChunkSize(int64(chunkSize))
 				return ForcePrintStatusAndHintRule, nil
 			}
 		}
 	case "dml-batch-size":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&this.migrationContext.DMLBatchSize))
+				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&srv.migrationContext.DMLBatchSize))
 				return NoPrintStatusRule, nil
 			}
 			if dmlBatchSize, err := strconv.Atoi(arg); err != nil {
 				return NoPrintStatusRule, err
 			} else {
-				this.migrationContext.SetDMLBatchSize(int64(dmlBatchSize))
+				srv.migrationContext.SetDMLBatchSize(int64(dmlBatchSize))
 				return ForcePrintStatusAndHintRule, nil
 			}
 		}
 	case "max-lag-millis":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&this.migrationContext.MaxLagMillisecondsThrottleThreshold))
+				fmt.Fprintf(writer, "%+v\n", atomic.LoadInt64(&srv.migrationContext.MaxLagMillisecondsThrottleThreshold))
 				return NoPrintStatusRule, nil
 			}
 			if maxLagMillis, err := strconv.Atoi(arg); err != nil {
 				return NoPrintStatusRule, err
 			} else {
-				this.migrationContext.SetMaxLagMillisecondsThrottleThreshold(int64(maxLagMillis))
+				srv.migrationContext.SetMaxLagMillisecondsThrottleThreshold(int64(maxLagMillis))
 				return ForcePrintStatusAndHintRule, nil
 			}
 		}
@@ -241,24 +346,24 @@ help                                 # This message
 	case "nice-ratio":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetNiceRatio())
+				fmt.Fprintf(writer, "%+v\n", srv.migrationContext.GetNiceRatio())
 				return NoPrintStatusRule, nil
 			}
 			if niceRatio, err := strconv.ParseFloat(arg, 64); err != nil {
 				return NoPrintStatusRule, err
 			} else {
-				this.migrationContext.SetNiceRatio(niceRatio)
+				srv.migrationContext.SetNiceRatio(niceRatio)
 				return ForcePrintStatusAndHintRule, nil
 			}
 		}
 	case "max-load":
 		{
 			if argIsQuestion {
-				maxLoad := this.migrationContext.GetMaxLoad()
+				maxLoad := srv.migrationContext.GetMaxLoad()
 				fmt.Fprintf(writer, "%s\n", maxLoad.String())
 				return NoPrintStatusRule, nil
 			}
-			if err := this.migrationContext.ReadMaxLoad(arg); err != nil {
+			if err := srv.migrationContext.ReadMaxLoad(arg); err != nil {
 				return NoPrintStatusRule, err
 			}
 			return ForcePrintStatusAndHintRule, nil
@@ -266,11 +371,11 @@ help                                 # This message
 	case "critical-load":
 		{
 			if argIsQuestion {
-				criticalLoad := this.migrationContext.GetCriticalLoad()
+				criticalLoad := srv.migrationContext.GetCriticalLoad()
 				fmt.Fprintf(writer, "%s\n", criticalLoad.String())
 				return NoPrintStatusRule, nil
 			}
-			if err := this.migrationContext.ReadCriticalLoad(arg); err != nil {
+			if err := srv.migrationContext.ReadCriticalLoad(arg); err != nil {
 				return NoPrintStatusRule, err
 			}
 			return ForcePrintStatusAndHintRule, nil
@@ -278,92 +383,106 @@ help                                 # This message
 	case "throttle-query":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetThrottleQuery())
+				fmt.Fprintf(writer, "%+v\n", srv.migrationContext.GetThrottleQuery())
 				return NoPrintStatusRule, nil
 			}
-			this.migrationContext.SetThrottleQuery(arg)
-			fmt.Fprintf(writer, throttleHint)
+			srv.migrationContext.SetThrottleQuery(arg)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-http":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetThrottleHTTP())
+				fmt.Fprintf(writer, "%+v\n", srv.migrationContext.GetThrottleHTTP())
 				return NoPrintStatusRule, nil
 			}
-			this.migrationContext.SetThrottleHTTP(arg)
-			fmt.Fprintf(writer, throttleHint)
+			srv.migrationContext.SetThrottleHTTP(arg)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle-control-replicas":
 		{
 			if argIsQuestion {
-				fmt.Fprintf(writer, "%s\n", this.migrationContext.GetThrottleControlReplicaKeys().ToCommaDelimitedList())
+				fmt.Fprintf(writer, "%s\n", srv.migrationContext.GetThrottleControlReplicaKeys().ToCommaDelimitedList())
 				return NoPrintStatusRule, nil
 			}
-			if err := this.migrationContext.ReadThrottleControlReplicaKeys(arg); err != nil {
+			if err := srv.migrationContext.ReadThrottleControlReplicaKeys(arg); err != nil {
 				return NoPrintStatusRule, err
 			}
-			fmt.Fprintf(writer, "%s\n", this.migrationContext.GetThrottleControlReplicaKeys().ToCommaDelimitedList())
+			fmt.Fprintf(writer, "%s\n", srv.migrationContext.GetThrottleControlReplicaKeys().ToCommaDelimitedList())
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "throttle", "pause", "suspend":
 		{
-			if arg != "" && arg != this.migrationContext.OriginalTableName {
+			if arg != "" && !srv.commandArgMatchesMigration(arg) {
 				// User explicitly provided table name. This is a courtesy protection mechanism
-				err := fmt.Errorf("User commanded 'throttle' on %s, but migrated table is %s; ignoring request.", arg, this.migrationContext.OriginalTableName)
+				err := fmt.Errorf("user commanded 'throttle' on %s, but migrated table is %s; ignoring request", arg, srv.migrationTargetDescription())
 				return NoPrintStatusRule, err
 			}
-			atomic.StoreInt64(&this.migrationContext.ThrottleCommandedByUser, 1)
-			fmt.Fprintf(writer, throttleHint)
+			atomic.StoreInt64(&srv.migrationContext.ThrottleCommandedByUser, 1)
+			fmt.Fprintln(writer, throttleHint)
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "no-throttle", "unthrottle", "resume", "continue":
 		{
-			if arg != "" && arg != this.migrationContext.OriginalTableName {
+			if arg != "" && !srv.commandArgMatchesMigration(arg) {
 				// User explicitly provided table name. This is a courtesy protection mechanism
-				err := fmt.Errorf("User commanded 'no-throttle' on %s, but migrated table is %s; ignoring request.", arg, this.migrationContext.OriginalTableName)
+				err := fmt.Errorf("user commanded 'no-throttle' on %s, but migrated table is %s; ignoring request", arg, srv.migrationTargetDescription())
 				return NoPrintStatusRule, err
 			}
-			atomic.StoreInt64(&this.migrationContext.ThrottleCommandedByUser, 0)
+			atomic.StoreInt64(&srv.migrationContext.ThrottleCommandedByUser, 0)
+			return ForcePrintStatusAndHintRule, nil
+		}
+	case "postpone-cut-over-flag-file":
+		{
+			if arg == "" {
+				err := fmt.Errorf("user commanded 'postpone-cut-over-flag-file' without specifying file path")
+				return NoPrintStatusRule, err
+			}
+			if err := srv.createPostponeCutOverFlagFile(arg); err != nil {
+				return NoPrintStatusRule, err
+			}
+			srv.migrationContext.PostponeCutOverFlagFile = arg
+			fmt.Fprintf(writer, "Postponed\n")
 			return ForcePrintStatusAndHintRule, nil
 		}
 	case "unpostpone", "no-postpone", "cut-over":
 		{
-			if arg == "" && this.migrationContext.ForceNamedCutOverCommand {
-				err := fmt.Errorf("User commanded 'unpostpone' without specifying table name, but --force-named-cut-over is set")
+			if arg == "" && srv.migrationContext.ForceNamedCutOverCommand {
+				err := fmt.Errorf("user commanded 'unpostpone' without specifying table name, but --force-named-cut-over is set")
 				return NoPrintStatusRule, err
 			}
-			if arg != "" && arg != this.migrationContext.OriginalTableName {
+			if arg != "" && !srv.commandArgMatchesMigration(arg) {
 				// User explicitly provided table name. This is a courtesy protection mechanism
-				err := fmt.Errorf("User commanded 'unpostpone' on %s, but migrated table is %s; ignoring request.", arg, this.migrationContext.OriginalTableName)
+				err := fmt.Errorf("user commanded 'unpostpone' on %s, but migrated table is %s; ignoring request", arg, srv.migrationTargetDescription())
 				return NoPrintStatusRule, err
 			}
-			if atomic.LoadInt64(&this.migrationContext.IsPostponingCutOver) > 0 {
-				atomic.StoreInt64(&this.migrationContext.UserCommandedUnpostponeFlag, 1)
+			if atomic.LoadInt64(&srv.migrationContext.IsPostponingCutOver) > 0 {
+				atomic.StoreInt64(&srv.migrationContext.UserCommandedUnpostponeFlag, 1)
 				fmt.Fprintf(writer, "Unpostponed\n")
 				return ForcePrintStatusAndHintRule, nil
 			}
-			fmt.Fprintf(writer, "You may only invoke this when gh-ost is actively postponing migration. At this time it is not.\n")
+			fmt.Fprintf(writer, "You may only invoke this when gh-ost is actively postponing migration. At this time it is not\n")
 			return NoPrintStatusRule, nil
 		}
 	case "panic":
 		{
-			if arg == "" && this.migrationContext.ForceNamedPanicCommand {
-				err := fmt.Errorf("User commanded 'panic' without specifying table name, but --force-named-panic is set")
+			if arg == "" && srv.migrationContext.ForceNamedPanicCommand {
+				err := fmt.Errorf("user commanded 'panic' without specifying table name, but --force-named-panic is set")
 				return NoPrintStatusRule, err
 			}
-			if arg != "" && arg != this.migrationContext.OriginalTableName {
+			if arg != "" && !srv.commandArgMatchesMigration(arg) {
 				// User explicitly provided table name. This is a courtesy protection mechanism
-				err := fmt.Errorf("User commanded 'panic' on %s, but migrated table is %s; ignoring request.", arg, this.migrationContext.OriginalTableName)
+				err := fmt.Errorf("user commanded 'panic' on %s, but migrated table is %s; ignoring request", arg, srv.migrationTargetDescription())
 				return NoPrintStatusRule, err
 			}
-			err := fmt.Errorf("User commanded 'panic'. The migration will be aborted without cleanup. Please drop the gh-ost tables before trying again.")
-			this.migrationContext.PanicAbort <- err
+			err := fmt.Errorf("user commanded 'panic'. The migration will be aborted without cleanup. Please drop the gh-ost tables before trying again")
+			// Use helper to prevent deadlock if listenOnPanicAbort already exited
+			_ = base.SendWithContext(srv.migrationContext.GetContext(), srv.migrationContext.PanicAbort, err)
 			return NoPrintStatusRule, err
 		}
 	default:
-		err = fmt.Errorf("Unknown command: %s", command)
+		err = fmt.Errorf("unknown command: %s", command)
 		return NoPrintStatusRule, err
 	}
 	return NoPrintStatusRule, nil

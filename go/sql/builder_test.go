@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,12 +8,11 @@ package sql
 import (
 	"testing"
 
-	"reflect"
 	"regexp"
 	"strings"
 
 	"github.com/openark/golib/log"
-	test "github.com/openark/golib/tests"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -25,7 +24,7 @@ func init() {
 }
 
 func normalizeQuery(name string) string {
-	name = strings.Replace(name, "`", "", -1)
+	name = strings.ReplaceAll(name, "`", "")
 	name = spacesRegexp.ReplaceAllString(name, " ")
 	name = strings.TrimSpace(name)
 	return name
@@ -35,7 +34,7 @@ func TestEscapeName(t *testing.T) {
 	names := []string{"my_table", `"my_table"`, "`my_table`"}
 	for _, name := range names {
 		escaped := EscapeName(name)
-		test.S(t).ExpectEquals(escaped, "`my_table`")
+		require.Equal(t, "`my_table`", escaped)
 	}
 }
 
@@ -44,27 +43,27 @@ func TestBuildEqualsComparison(t *testing.T) {
 		columns := []string{"c1"}
 		values := []string{"@v1"}
 		comparison, err := BuildEqualsComparison(columns, values)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` = @v1))")
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` = @v1))", comparison)
 	}
 	{
 		columns := []string{"c1", "c2"}
 		values := []string{"@v1", "@v2"}
 		comparison, err := BuildEqualsComparison(columns, values)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` = @v1) and (`c2` = @v2))")
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` = @v1) and (`c2` = @v2))", comparison)
 	}
 	{
 		columns := []string{"c1"}
 		values := []string{"@v1", "@v2"}
 		_, err := BuildEqualsComparison(columns, values)
-		test.S(t).ExpectNotNil(err)
+		require.Error(t, err)
 	}
 	{
 		columns := []string{}
 		values := []string{}
 		_, err := BuildEqualsComparison(columns, values)
-		test.S(t).ExpectNotNil(err)
+		require.Error(t, err)
 	}
 }
 
@@ -72,8 +71,8 @@ func TestBuildEqualsPreparedComparison(t *testing.T) {
 	{
 		columns := []string{"c1", "c2"}
 		comparison, err := BuildEqualsPreparedComparison(columns)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` = ?) and (`c2` = ?))")
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` = ?) and (`c2` = ?))", comparison)
 	}
 }
 
@@ -81,19 +80,19 @@ func TestBuildSetPreparedClause(t *testing.T) {
 	{
 		columns := NewColumnList([]string{"c1"})
 		clause, err := BuildSetPreparedClause(columns)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(clause, "`c1`=?")
+		require.NoError(t, err)
+		require.Equal(t, "`c1`=?", clause)
 	}
 	{
 		columns := NewColumnList([]string{"c1", "c2"})
 		clause, err := BuildSetPreparedClause(columns)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(clause, "`c1`=?, `c2`=?")
+		require.NoError(t, err)
+		require.Equal(t, "`c1`=?, `c2`=?", clause)
 	}
 	{
 		columns := NewColumnList([]string{})
 		_, err := BuildSetPreparedClause(columns)
-		test.S(t).ExpectNotNil(err)
+		require.Error(t, err)
 	}
 }
 
@@ -103,59 +102,59 @@ func TestBuildRangeComparison(t *testing.T) {
 		values := []string{"@v1"}
 		args := []interface{}{3}
 		comparison, explodedArgs, err := BuildRangeComparison(columns, values, args, LessThanComparisonSign)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` < @v1))")
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3}))
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` < @v1))", comparison)
+		require.Equal(t, []interface{}{3}, explodedArgs)
 	}
 	{
 		columns := []string{"c1"}
 		values := []string{"@v1"}
 		args := []interface{}{3}
 		comparison, explodedArgs, err := BuildRangeComparison(columns, values, args, LessThanOrEqualsComparisonSign)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` < @v1) or ((`c1` = @v1)))")
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3}))
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` < @v1) or ((`c1` = @v1)))", comparison)
+		require.Equal(t, []interface{}{3, 3}, explodedArgs)
 	}
 	{
 		columns := []string{"c1", "c2"}
 		values := []string{"@v1", "@v2"}
 		args := []interface{}{3, 17}
 		comparison, explodedArgs, err := BuildRangeComparison(columns, values, args, LessThanComparisonSign)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)))")
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17}))
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)))", comparison)
+		require.Equal(t, []interface{}{3, 3, 17}, explodedArgs)
 	}
 	{
 		columns := []string{"c1", "c2"}
 		values := []string{"@v1", "@v2"}
 		args := []interface{}{3, 17}
 		comparison, explodedArgs, err := BuildRangeComparison(columns, values, args, LessThanOrEqualsComparisonSign)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)) or ((`c1` = @v1) and (`c2` = @v2)))")
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 3, 17}))
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)) or ((`c1` = @v1) and (`c2` = @v2)))", comparison)
+		require.Equal(t, []interface{}{3, 3, 17, 3, 17}, explodedArgs)
 	}
 	{
 		columns := []string{"c1", "c2", "c3"}
 		values := []string{"@v1", "@v2", "@v3"}
 		args := []interface{}{3, 17, 22}
 		comparison, explodedArgs, err := BuildRangeComparison(columns, values, args, LessThanOrEqualsComparisonSign)
-		test.S(t).ExpectNil(err)
-		test.S(t).ExpectEquals(comparison, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)) or (((`c1` = @v1) and (`c2` = @v2)) AND (`c3` < @v3)) or ((`c1` = @v1) and (`c2` = @v2) and (`c3` = @v3)))")
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 3, 17, 22, 3, 17, 22}))
+		require.NoError(t, err)
+		require.Equal(t, "((`c1` < @v1) or (((`c1` = @v1)) AND (`c2` < @v2)) or (((`c1` = @v1) and (`c2` = @v2)) AND (`c3` < @v3)) or ((`c1` = @v1) and (`c2` = @v2) and (`c3` = @v3)))", comparison)
+		require.Equal(t, []interface{}{3, 3, 17, 3, 17, 22, 3, 17, 22}, explodedArgs)
 	}
 	{
 		columns := []string{"c1"}
 		values := []string{"@v1", "@v2"}
 		args := []interface{}{3, 17}
 		_, _, err := BuildRangeComparison(columns, values, args, LessThanOrEqualsComparisonSign)
-		test.S(t).ExpectNotNil(err)
+		require.Error(t, err)
 	}
 	{
 		columns := []string{}
 		values := []string{}
 		args := []interface{}{}
 		_, _, err := BuildRangeComparison(columns, values, args, LessThanOrEqualsComparisonSign)
-		test.S(t).ExpectNotNil(err)
+		require.Error(t, err)
 	}
 }
 
@@ -172,18 +171,28 @@ func TestBuildRangeInsertQuery(t *testing.T) {
 		rangeStartArgs := []interface{}{3}
 		rangeEndArgs := []interface{}{103}
 
-		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, false)
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
 		expected := `
-				insert /* gh-ost mydb.tbl */ ignore into mydb.ghost (id, name, position)
-				(select id, name, position from mydb.tbl force index (PRIMARY)
-					where (((id > @v1s) or ((id = @v1s))) and ((id < @v1e) or ((id = @v1e))))
-				)
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 103, 103}))
+			insert /* gh-ost mydb.tbl */ ignore
+			into
+				mydb.ghost
+				(id, name, position)
+			(
+				select id, name, position
+				from
+					mydb.tbl
+				force index (PRIMARY)
+				where
+					(((id > @v1s) or ((id = @v1s)))
+					and ((id < @v1e) or ((id = @v1e))))
+				for share nowait
+			)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 3, 103, 103}, explodedArgs)
 	}
 	{
+		// Different first-column values → 3-part UNION insert.
 		uniqueKey := "name_position_uidx"
 		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
 		rangeStartValues := []string{"@v1s", "@v2s"}
@@ -191,16 +200,111 @@ func TestBuildRangeInsertQuery(t *testing.T) {
 		rangeStartArgs := []interface{}{3, 17}
 		rangeEndArgs := []interface{}{103, 117}
 
-		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, false)
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
 		expected := `
-				insert /* gh-ost mydb.tbl */ ignore into mydb.ghost (id, name, position)
-				(select id, name, position from mydb.tbl force index (name_position_uidx)
-				  where (((name > @v1s) or (((name = @v1s)) AND (position > @v2s)) or ((name = @v1s) and (position = @v2s))) and ((name < @v1e) or (((name = @v1e)) AND (position < @v2e)) or ((name = @v1e) and (position = @v2e))))
-				)
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 3, 17, 103, 103, 117, 103, 117}))
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, position)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1s and position >= @v2s for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > @v1s and name < @v1e for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1e and position <= @v2e for share nowait)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// Same first-column value → single range query (no UNION needed).
+		uniqueKey := "name_position_uidx"
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartValues := []string{"@v1s", "@v2s"}
+		rangeEndValues := []string{"@v1e", "@v2e"}
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{3, 117}
+
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
+		expected := `
+			insert /* gh-ost mydb.tbl */ ignore
+			into
+				mydb.ghost
+				(id, name, position)
+			(
+				select id, name, position
+				from
+					mydb.tbl
+				force index (name_position_uidx)
+					where (name = @v1s and position >= @v2s and position <= @v2e)
+					for share nowait
+			)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 117}, explodedArgs)
+	}
+	{
+		// includeRangeStartValues=false → exclusive start (col2 uses >, not >=).
+		uniqueKey := "name_position_uidx"
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartValues := []string{"@v1s", "@v2s"}
+		rangeEndValues := []string{"@v1e", "@v2e"}
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{103, 117}
+
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, false, true, true)
+		require.NoError(t, err)
+		expected := `
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, position)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1s and position > @v2s for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > @v1s and name < @v1e for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1e and position <= @v2e for share nowait)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// transactionalTable=false → no locking clause on UNION subqueries.
+		uniqueKey := "name_position_uidx"
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartValues := []string{"@v1s", "@v2s"}
+		rangeEndValues := []string{"@v1e", "@v2e"}
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{103, 117}
+
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, false, false)
+		require.NoError(t, err)
+		expected := `
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, position)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1s and position >= @v2s )
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > @v1s and name < @v1e )
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1e and position <= @v2e )`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// transactionalTable=true, noWait=false → "lock in share mode" on UNION subqueries.
+		uniqueKey := "name_position_uidx"
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartValues := []string{"@v1s", "@v2s"}
+		rangeEndValues := []string{"@v1e", "@v2e"}
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{103, 117}
+
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, false)
+		require.NoError(t, err)
+		expected := `
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, position)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1s and position >= @v2s lock in share mode)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > @v1s and name < @v1e lock in share mode)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1e and position <= @v2e lock in share mode)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
 	}
 }
 
@@ -218,16 +322,26 @@ func TestBuildRangeInsertQueryRenameMap(t *testing.T) {
 		rangeStartArgs := []interface{}{3}
 		rangeEndArgs := []interface{}{103}
 
-		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, false)
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
 		expected := `
-				insert /* gh-ost mydb.tbl */ ignore into mydb.ghost (id, name, location)
-				(select id, name, position from mydb.tbl force index (PRIMARY)
-					where (((id > @v1s) or ((id = @v1s))) and ((id < @v1e) or ((id = @v1e))))
-				)
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 103, 103}))
+			insert /* gh-ost mydb.tbl */ ignore
+			into
+				mydb.ghost
+				(id, name, location)
+			(
+				select id, name, position
+				from
+					mydb.tbl
+				force index (PRIMARY)
+				where
+					(((id > @v1s) or ((id = @v1s)))
+					and
+					((id < @v1e) or ((id = @v1e))))
+				for share nowait
+			)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 3, 103, 103}, explodedArgs)
 	}
 	{
 		uniqueKey := "name_position_uidx"
@@ -237,16 +351,18 @@ func TestBuildRangeInsertQueryRenameMap(t *testing.T) {
 		rangeStartArgs := []interface{}{3, 17}
 		rangeEndArgs := []interface{}{103, 117}
 
-		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, false)
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
 		expected := `
-				insert /* gh-ost mydb.tbl */ ignore into mydb.ghost (id, name, location)
-				(select id, name, position from mydb.tbl force index (name_position_uidx)
-				  where (((name > @v1s) or (((name = @v1s)) AND (position > @v2s)) or ((name = @v1s) and (position = @v2s))) and ((name < @v1e) or (((name = @v1e)) AND (position < @v2e)) or ((name = @v1e) and (position = @v2e))))
-				)
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 3, 17, 103, 103, 117, 103, 117}))
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, location)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1s and position >= @v2s for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > @v1s and name < @v1e for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = @v1e and position <= @v2e for share nowait)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
 	}
 }
 
@@ -261,48 +377,329 @@ func TestBuildRangeInsertPreparedQuery(t *testing.T) {
 		rangeStartArgs := []interface{}{3, 17}
 		rangeEndArgs := []interface{}{103, 117}
 
-		query, explodedArgs, err := BuildRangeInsertPreparedQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartArgs, rangeEndArgs, true, true)
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildRangeInsertPreparedQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
 		expected := `
-				insert /* gh-ost mydb.tbl */ ignore into mydb.ghost (id, name, position)
-				(select id, name, position from mydb.tbl force index (name_position_uidx)
-				  where (((name > ?) or (((name = ?)) AND (position > ?)) or ((name = ?) and (position = ?))) and ((name < ?) or (((name = ?)) AND (position < ?)) or ((name = ?) and (position = ?))))
-				lock in share mode )
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 3, 17, 103, 103, 117, 103, 117}))
+			insert /* gh-ost mydb.tbl */ ignore
+			into mydb.ghost (id, name, position)
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = ? and position >= ? for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name > ? and name < ? for share nowait)
+			union all
+			(select id, name, position from mydb.tbl force index (name_position_uidx) where name = ? and position <= ? for share nowait)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// Same first-column value → single range query (no UNION needed).
+		uniqueKey := "name_position_uidx"
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{3, 117}
+
+		query, explodedArgs, err := BuildRangeInsertPreparedQuery(databaseName, originalTableName, ghostTableName, sharedColumns, sharedColumns, uniqueKey, uniqueKeyColumns, rangeStartArgs, rangeEndArgs, true, true, true)
+		require.NoError(t, err)
+		expected := `
+			insert /* gh-ost mydb.tbl */ ignore
+			into
+				mydb.ghost
+				(id, name, position)
+			(
+				select id, name, position
+				from
+					mydb.tbl
+				force index (name_position_uidx)
+					where (name = ? and position >= ? and position <= ?)
+					for share nowait
+			)`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 117}, explodedArgs)
 	}
 }
 
-func TestBuildUniqueKeyRangeEndPreparedQuery(t *testing.T) {
+func TestBuildUniqueKeyRangeEndPreparedQueryViaOffset(t *testing.T) {
 	databaseName := "mydb"
 	originalTableName := "tbl"
 	var chunkSize int64 = 500
 	{
+		// Different first-column values → 3-part UNION for efficient boundary seeks.
+		// A named (non-PRIMARY) key asserts the caller-supplied key reaches the force index hint.
 		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
 		rangeStartArgs := []interface{}{3, 17}
 		rangeEndArgs := []interface{}{103, 117}
 
-		query, explodedArgs, err := BuildUniqueKeyRangeEndPreparedQueryViaTemptable(databaseName, originalTableName, uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
-		test.S(t).ExpectNil(err)
+		query, explodedArgs, err := BuildUniqueKeyRangeEndPreparedQueryViaOffset(databaseName, originalTableName, "name_position_uidx", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
 		expected := `
-				select /* gh-ost mydb.tbl test */ name, position
-				  from (
-				    select
-				        name, position
-				      from
-				        mydb.tbl
-				      where ((name > ?) or (((name = ?)) AND (position > ?))) and ((name < ?) or (((name = ?)) AND (position < ?)) or ((name = ?) and (position = ?)))
-				      order by
-				        name asc, position asc
-				      limit 500
-				  ) select_osc_chunk
-				order by
-				  name desc, position desc
-				limit 1
-		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(explodedArgs, []interface{}{3, 3, 17, 103, 103, 117, 103, 117}))
+			select /* gh-ost mydb.tbl test */
+				name, position
+			from
+				((select name, position from mydb.tbl force index (name_position_uidx) where name = ? and position > ? order by name asc, position asc limit 500)
+				union all
+				(select name, position from mydb.tbl force index (name_position_uidx) where name > ? and name < ? order by name asc, position asc limit 500)
+				union all
+				(select name, position from mydb.tbl force index (name_position_uidx) where name = ? and position <= ? order by name asc, position asc limit 500)) t
+			order by
+				name asc, position asc
+			limit 1
+			offset 499`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// Same first-column value → single range query (no UNION needed).
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{3, 117}
+
+		query, explodedArgs, err := BuildUniqueKeyRangeEndPreparedQueryViaOffset(databaseName, originalTableName, "PRIMARY", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
+		expected := `
+			select /* gh-ost mydb.tbl test */
+				name, position
+			from
+				mydb.tbl force index (PRIMARY)
+			where
+				(name = ? and position > ? and position <= ?)
+			order by
+				name asc, position asc
+			limit 1
+			offset 499`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 117}, explodedArgs)
+	}
+}
+
+func TestBuildUniqueKeyRangeEndPreparedQueryViaTemptable(t *testing.T) {
+	databaseName := "mydb"
+	originalTableName := "tbl"
+	var chunkSize int64 = 500
+	{
+		// Different first-column values → 3-part UNION for efficient boundary seeks.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{103, 117}
+
+		query, explodedArgs, err := BuildUniqueKeyRangeEndPreparedQueryViaTemptable(databaseName, originalTableName, "PRIMARY", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
+		expected := `
+			select /* gh-ost mydb.tbl test */ name, position
+			from (
+				select name, position
+				from
+					((select name, position from mydb.tbl force index (PRIMARY) where name = ? and position > ? order by name asc, position asc limit 500)
+					union all
+					(select name, position from mydb.tbl force index (PRIMARY) where name > ? and name < ? order by name asc, position asc limit 500)
+					union all
+					(select name, position from mydb.tbl force index (PRIMARY) where name = ? and position <= ? order by name asc, position asc limit 500)) t
+				order by name asc, position asc
+				limit 500
+			) select_osc_chunk
+			order by name desc, position desc
+			limit 1`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+	}
+	{
+		// Same first-column value → single range query (no UNION needed).
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		rangeStartArgs := []interface{}{3, 17}
+		rangeEndArgs := []interface{}{3, 117}
+
+		query, explodedArgs, err := BuildUniqueKeyRangeEndPreparedQueryViaTemptable(databaseName, originalTableName, "PRIMARY", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
+		expected := `
+			select /* gh-ost mydb.tbl test */ name, position
+			from (
+				select name, position
+				from mydb.tbl force index (PRIMARY)
+				where (name = ? and position > ? and position <= ?)
+				order by name asc, position asc
+				limit 500
+			) select_osc_chunk
+			order by name desc, position desc
+			limit 1`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, 17, 117}, explodedArgs)
+	}
+}
+
+func TestBuildUniqueKeyRangeEndPreparedQueryTwoColumnEnum(t *testing.T) {
+	databaseName := "mydb"
+	originalTableName := "tbl"
+	var chunkSize int64 = 500
+	{
+		// First key column is an enum → ORDER BY must wrap it with concat() so MySQL
+		// sorts by the enum's text label rather than its internal numeric position.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		uniqueKeyColumns.SetColumnType("name", EnumColumnType)
+		rangeStartArgs := []interface{}{"a", 17}
+		rangeEndArgs := []interface{}{"z", 117}
+
+		query, _, err := BuildUniqueKeyRangeEndPreparedQueryViaOffset(databaseName, originalTableName, "PRIMARY", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
+		expected := `
+			select /* gh-ost mydb.tbl test */
+				name, position
+			from
+				((select name, position from mydb.tbl force index (PRIMARY) where name = ? and position > ? order by concat(name) asc, position asc limit 500)
+				union all
+				(select name, position from mydb.tbl force index (PRIMARY) where name > ? and name < ? order by concat(name) asc, position asc limit 500)
+				union all
+				(select name, position from mydb.tbl force index (PRIMARY) where name = ? and position <= ? order by concat(name) asc, position asc limit 500)) t
+			order by
+				concat(name) asc, position asc
+			limit 1
+			offset 499`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+	}
+	{
+		// Second key column is an enum → its asc/desc clauses get concat() too.
+		// ViaTemptable also exercises the desc ORDER BY in the outer wrapper.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		uniqueKeyColumns.SetColumnType("position", EnumColumnType)
+		rangeStartArgs := []interface{}{3, "a"}
+		rangeEndArgs := []interface{}{103, "z"}
+
+		query, _, err := BuildUniqueKeyRangeEndPreparedQueryViaTemptable(databaseName, originalTableName, "PRIMARY", uniqueKeyColumns, rangeStartArgs, rangeEndArgs, chunkSize, false, "test")
+		require.NoError(t, err)
+		expected := `
+			select /* gh-ost mydb.tbl test */ name, position
+			from (
+				select name, position
+				from
+					((select name, position from mydb.tbl force index (PRIMARY) where name = ? and position > ? order by name asc, concat(position) asc limit 500)
+					union all
+					(select name, position from mydb.tbl force index (PRIMARY) where name > ? and name < ? order by name asc, concat(position) asc limit 500)
+					union all
+					(select name, position from mydb.tbl force index (PRIMARY) where name = ? and position <= ? order by name asc, concat(position) asc limit 500)) t
+				order by name asc, concat(position) asc
+				limit 500
+			) select_osc_chunk
+			order by name desc, concat(position) desc
+			limit 1`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+	}
+}
+
+func TestSameFirstColumnValue(t *testing.T) {
+	{
+		// Identical integer values match.
+		require.True(t, sameFirstColumnValue([]interface{}{3, 17}, []interface{}{3, 117}))
+	}
+	{
+		// Different integer values do not match.
+		require.False(t, sameFirstColumnValue([]interface{}{3, 17}, []interface{}{4, 17}))
+	}
+	{
+		// Identical string values match.
+		require.True(t, sameFirstColumnValue([]interface{}{"abc", 1}, []interface{}{"abc", 2}))
+	}
+	{
+		// fmt.Sprintf("%v", x) is the comparison key — int(3) and "3" stringify
+		// identically and are therefore treated as equal. This is intentional:
+		// real callers pass type-consistent args originating from the same row.
+		require.True(t, sameFirstColumnValue([]interface{}{3, 1}, []interface{}{"3", 2}))
+	}
+}
+
+func TestNewTwoColumnRangeMeta(t *testing.T) {
+	{
+		// No enum columns → plain "col asc" / "col desc" ORDER BY clauses.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		m := newTwoColumnRangeMeta(uniqueKeyColumns)
+		require.Equal(t, "`name`", m.col1Name)
+		require.Equal(t, "`position`", m.col2Name)
+		require.Equal(t, "?", m.col1Val)
+		require.Equal(t, "?", m.col2Val)
+		require.Equal(t, "`name` asc, `position` asc", m.orderByAsc)
+		require.Equal(t, "`name` desc, `position` desc", m.orderByDesc)
+	}
+	{
+		// Enum on first column only.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		uniqueKeyColumns.SetColumnType("name", EnumColumnType)
+		m := newTwoColumnRangeMeta(uniqueKeyColumns)
+		require.Equal(t, "concat(`name`) asc, `position` asc", m.orderByAsc)
+		require.Equal(t, "concat(`name`) desc, `position` desc", m.orderByDesc)
+	}
+	{
+		// Enum on second column only.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		uniqueKeyColumns.SetColumnType("position", EnumColumnType)
+		m := newTwoColumnRangeMeta(uniqueKeyColumns)
+		require.Equal(t, "`name` asc, concat(`position`) asc", m.orderByAsc)
+		require.Equal(t, "`name` desc, concat(`position`) desc", m.orderByDesc)
+	}
+	{
+		// Enum on both columns.
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		uniqueKeyColumns.SetColumnType("name", EnumColumnType)
+		uniqueKeyColumns.SetColumnType("position", EnumColumnType)
+		m := newTwoColumnRangeMeta(uniqueKeyColumns)
+		require.Equal(t, "concat(`name`) asc, concat(`position`) asc", m.orderByAsc)
+		require.Equal(t, "concat(`name`) desc, concat(`position`) desc", m.orderByDesc)
+	}
+}
+
+func TestBuildTwoColumnUnionParts(t *testing.T) {
+	rangeStartArgs := []interface{}{3, 17}
+	rangeEndArgs := []interface{}{103, 117}
+	part1, part2, part3, explodedArgs := buildTwoColumnUnionParts(
+		"name, position", "mydb.tbl",
+		"name", "position",
+		"?", "?", "?", "?",
+		">=", "order by name asc, position asc limit 500",
+		rangeStartArgs, rangeEndArgs,
+	)
+	require.Equal(t, normalizeQuery("(select name, position from mydb.tbl where name = ? and position >= ? order by name asc, position asc limit 500)"), normalizeQuery(part1))
+	require.Equal(t, normalizeQuery("(select name, position from mydb.tbl where name > ? and name < ? order by name asc, position asc limit 500)"), normalizeQuery(part2))
+	require.Equal(t, normalizeQuery("(select name, position from mydb.tbl where name = ? and position <= ? order by name asc, position asc limit 500)"), normalizeQuery(part3))
+	// Args follow the column order each subquery binds: (start1, start2), (start1, end1), (end1, end2).
+	require.Equal(t, []interface{}{3, 17, 3, 103, 103, 117}, explodedArgs)
+}
+
+func TestBuildRangeInsertQueryTwoColumnGuards(t *testing.T) {
+	databaseName := "mydb"
+	originalTableName := "tbl"
+	ghostTableName := "ghost"
+	sharedColumnsListing := "id, name, position"
+	uniqueKey := "name_position_uidx"
+	uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+	validValues := []string{"@v1", "@v2"}
+	validArgs := []interface{}{3, 17}
+
+	call := func(rangeStartValues, rangeEndValues []string, rangeStartArgs, rangeEndArgs []interface{}) error {
+		_, _, err := buildRangeInsertQueryTwoColumn(
+			databaseName, originalTableName, ghostTableName,
+			sharedColumnsListing, sharedColumnsListing,
+			uniqueKey, uniqueKeyColumns,
+			rangeStartValues, rangeEndValues,
+			rangeStartArgs, rangeEndArgs,
+			GreaterThanOrEqualsComparisonSign, "",
+		)
+		return err
+	}
+
+	{
+		// rangeStartValues length mismatch.
+		err := call([]string{"@v1"}, validValues, validArgs, validArgs)
+		require.ErrorContains(t, err, "got 2 columns but 1 rangeStartValues")
+	}
+	{
+		// rangeEndValues length mismatch.
+		err := call(validValues, []string{"@v1", "@v2", "@v3"}, validArgs, validArgs)
+		require.ErrorContains(t, err, "got 2 columns but 3 rangeEndValues")
+	}
+	{
+		// rangeStartArgs length mismatch.
+		err := call(validValues, validValues, []interface{}{3}, validArgs)
+		require.ErrorContains(t, err, "got 2 columns but 1 rangeStartArgs")
+	}
+	{
+		// rangeEndArgs length mismatch.
+		err := call(validValues, validValues, validArgs, []interface{}{})
+		require.ErrorContains(t, err, "got 2 columns but 0 rangeEndArgs")
 	}
 }
 
@@ -310,31 +707,34 @@ func TestBuildUniqueKeyMinValuesPreparedQuery(t *testing.T) {
 	databaseName := "mydb"
 	originalTableName := "tbl"
 	uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+	uniqueKey := &UniqueKey{Name: "PRIMARY", Columns: *uniqueKeyColumns}
 	{
-		query, err := BuildUniqueKeyMinValuesPreparedQuery(databaseName, originalTableName, uniqueKeyColumns)
-		test.S(t).ExpectNil(err)
+		query, err := BuildUniqueKeyMinValuesPreparedQuery(databaseName, originalTableName, uniqueKey)
+		require.NoError(t, err)
 		expected := `
 			select /* gh-ost mydb.tbl */ name, position
 			  from
 			    mydb.tbl
+			  force index (PRIMARY)
 			  order by
 			    name asc, position asc
 			  limit 1
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
 	}
 	{
-		query, err := BuildUniqueKeyMaxValuesPreparedQuery(databaseName, originalTableName, uniqueKeyColumns)
-		test.S(t).ExpectNil(err)
+		query, err := BuildUniqueKeyMaxValuesPreparedQuery(databaseName, originalTableName, uniqueKey)
+		require.NoError(t, err)
 		expected := `
 			select /* gh-ost mydb.tbl */ name, position
 			  from
 			    mydb.tbl
+			  force index (PRIMARY)
 			  order by
 			    name desc, position desc
 			  limit 1
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
 	}
 }
 
@@ -345,9 +745,11 @@ func TestBuildDMLDeleteQuery(t *testing.T) {
 	args := []interface{}{3, "testname", "first", 17, 23}
 	{
 		uniqueKeyColumns := NewColumnList([]string{"position"})
+		builder, err := NewDMLDeleteQueryBuilder(databaseName, tableName, tableColumns, uniqueKeyColumns)
+		require.NoError(t, err)
 
-		query, uniqueKeyArgs, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNil(err)
+		query, uniqueKeyArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
 			delete /* gh-ost mydb.tbl */
 				from
@@ -355,14 +757,16 @@ func TestBuildDMLDeleteQuery(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{17}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{17}, uniqueKeyArgs)
 	}
 	{
 		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+		builder, err := NewDMLDeleteQueryBuilder(databaseName, tableName, tableColumns, uniqueKeyColumns)
+		require.NoError(t, err)
 
-		query, uniqueKeyArgs, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNil(err)
+		query, uniqueKeyArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
 			delete /* gh-ost mydb.tbl */
 				from
@@ -370,14 +774,16 @@ func TestBuildDMLDeleteQuery(t *testing.T) {
 				where
 					((name = ?) and (position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{"testname", 17}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{"testname", 17}, uniqueKeyArgs)
 	}
 	{
 		uniqueKeyColumns := NewColumnList([]string{"position", "name"})
+		builder, err := NewDMLDeleteQueryBuilder(databaseName, tableName, tableColumns, uniqueKeyColumns)
+		require.NoError(t, err)
 
-		query, uniqueKeyArgs, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNil(err)
+		query, uniqueKeyArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
 			delete /* gh-ost mydb.tbl */
 				from
@@ -385,15 +791,17 @@ func TestBuildDMLDeleteQuery(t *testing.T) {
 				where
 					((position = ?) and (name = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{17, "testname"}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{17, "testname"}, uniqueKeyArgs)
 	}
 	{
 		uniqueKeyColumns := NewColumnList([]string{"position", "name"})
 		args := []interface{}{"first", 17}
+		builder, err := NewDMLDeleteQueryBuilder(databaseName, tableName, tableColumns, uniqueKeyColumns)
+		require.NoError(t, err)
 
-		_, _, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNotNil(err)
+		_, _, err = builder.BuildQuery(args)
+		require.Error(t, err)
 	}
 }
 
@@ -402,11 +810,13 @@ func TestBuildDMLDeleteQuerySignedUnsigned(t *testing.T) {
 	tableName := "tbl"
 	tableColumns := NewColumnList([]string{"id", "name", "rank", "position", "age"})
 	uniqueKeyColumns := NewColumnList([]string{"position"})
+	builder, err := NewDMLDeleteQueryBuilder(databaseName, tableName, tableColumns, uniqueKeyColumns)
+	require.NoError(t, err)
 	{
 		// test signed (expect no change)
 		args := []interface{}{3, "testname", "first", -1, 23}
-		query, uniqueKeyArgs, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNil(err)
+		query, uniqueKeyArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
 			delete /* gh-ost mydb.tbl */
 				from
@@ -414,15 +824,15 @@ func TestBuildDMLDeleteQuerySignedUnsigned(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{-1}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{-1}, uniqueKeyArgs)
 	}
 	{
 		// test unsigned
 		args := []interface{}{3, "testname", "first", int8(-1), 23}
 		uniqueKeyColumns.SetUnsigned("position")
-		query, uniqueKeyArgs, err := BuildDMLDeleteQuery(databaseName, tableName, tableColumns, uniqueKeyColumns, args)
-		test.S(t).ExpectNil(err)
+		query, uniqueKeyArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
 			delete /* gh-ost mydb.tbl */
 				from
@@ -430,8 +840,8 @@ func TestBuildDMLDeleteQuerySignedUnsigned(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{uint8(255)}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{uint8(255)}, uniqueKeyArgs)
 	}
 }
 
@@ -442,41 +852,45 @@ func TestBuildDMLInsertQuery(t *testing.T) {
 	args := []interface{}{3, "testname", "first", 17, 23}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
-		query, sharedArgs, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.NoError(t, err)
+		query, sharedArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
-			replace /* gh-ost mydb.tbl */
+			insert /* gh-ost mydb.tbl */ ignore
 				into mydb.tbl
 					(id, name, position, age)
 				values
 					(?, ?, ?, ?)
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23}, sharedArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"position", "name", "age", "id"})
-		query, sharedArgs, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.NoError(t, err)
+		query, sharedArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
-			replace /* gh-ost mydb.tbl */
+			insert /* gh-ost mydb.tbl */ ignore
 				into mydb.tbl
 					(position, name, age, id)
 				values
 					(?, ?, ?, ?)
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{17, "testname", 23, 3}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{17, "testname", 23, 3}, sharedArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"position", "name", "surprise", "id"})
-		_, _, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNotNil(err)
+		_, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.Error(t, err)
 	}
 	{
 		sharedColumns := NewColumnList([]string{})
-		_, _, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNotNil(err)
+		_, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.Error(t, err)
 	}
 }
 
@@ -489,49 +903,55 @@ func TestBuildDMLInsertQuerySignedUnsigned(t *testing.T) {
 		// testing signed
 		args := []interface{}{3, "testname", "first", int8(-1), 23}
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
-		query, sharedArgs, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.NoError(t, err)
+		query, sharedArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
-			replace /* gh-ost mydb.tbl */
+			insert /* gh-ost mydb.tbl */ ignore
 				into mydb.tbl
 					(id, name, position, age)
 				values
 					(?, ?, ?, ?)
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", int8(-1), 23}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", int8(-1), 23}, sharedArgs)
 	}
 	{
 		// testing unsigned
 		args := []interface{}{3, "testname", "first", int8(-1), 23}
 		sharedColumns.SetUnsigned("position")
-		query, sharedArgs, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.NoError(t, err)
+		query, sharedArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
-			replace /* gh-ost mydb.tbl */
+			insert /* gh-ost mydb.tbl */ ignore
 				into mydb.tbl
 					(id, name, position, age)
 				values
 					(?, ?, ?, ?)
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", uint8(255), 23}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", uint8(255), 23}, sharedArgs)
 	}
 	{
 		// testing unsigned
 		args := []interface{}{3, "testname", "first", int32(-1), 23}
 		sharedColumns.SetUnsigned("position")
-		query, sharedArgs, err := BuildDMLInsertQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, args)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLInsertQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns)
+		require.NoError(t, err)
+		query, sharedArgs, err := builder.BuildQuery(args)
+		require.NoError(t, err)
 		expected := `
-			replace /* gh-ost mydb.tbl */
+			insert /* gh-ost mydb.tbl */ ignore
 				into mydb.tbl
 					(id, name, position, age)
 				values
 					(?, ?, ?, ?)
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", uint32(4294967295), 23}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", uint32(4294967295), 23}, sharedArgs)
 	}
 }
 
@@ -544,8 +964,10 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"position"})
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.NoError(t, err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -553,15 +975,16 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{17}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23, 17}, updateArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"position", "name"})
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.NoError(t, err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -569,15 +992,16 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 				where
 					((position = ?) and (name = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{17, "testname"}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23, 17, "testname"}, updateArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"age"})
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.NoError(t, err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -585,15 +1009,16 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 				where
 					((age = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{56}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23, 56}, updateArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"age", "position", "id", "name"})
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.NoError(t, err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -601,28 +1026,29 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 				where
 					((age = ?) and (position = ?) and (id = ?) and (name = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{56, 17, 3, "testname"}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23, 56, 17, 3, "testname"}, updateArgs)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"age", "surprise"})
-		_, _, _, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNotNil(err)
+		_, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.Error(t, err)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		uniqueKeyColumns := NewColumnList([]string{})
-		_, _, _, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNotNil(err)
+		_, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+		require.Error(t, err)
 	}
 	{
 		sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 		mappedColumns := NewColumnList([]string{"id", "name", "role", "age"})
 		uniqueKeyColumns := NewColumnList([]string{"id"})
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, mappedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, mappedColumns, uniqueKeyColumns)
+		require.NoError(t, err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -630,9 +1056,8 @@ func TestBuildDMLUpdateQuery(t *testing.T) {
 				where
 					((id = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", 17, 23}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{3}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", 17, 23, 3}, updateArgs)
 	}
 }
 
@@ -644,10 +1069,12 @@ func TestBuildDMLUpdateQuerySignedUnsigned(t *testing.T) {
 	whereArgs := []interface{}{3, "testname", "findme", int8(-3), 56}
 	sharedColumns := NewColumnList([]string{"id", "name", "position", "age"})
 	uniqueKeyColumns := NewColumnList([]string{"position"})
+	builder, err := NewDMLUpdateQueryBuilder(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns)
+	require.NoError(t, err)
 	{
 		// test signed
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -655,16 +1082,15 @@ func TestBuildDMLUpdateQuerySignedUnsigned(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", int8(-17), int8(-2)}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{int8(-3)}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", int8(-17), int8(-2), int8(-3)}, updateArgs)
 	}
 	{
 		// test unsigned
 		sharedColumns.SetUnsigned("age")
 		uniqueKeyColumns.SetUnsigned("position")
-		query, sharedArgs, uniqueKeyArgs, err := BuildDMLUpdateQuery(databaseName, tableName, tableColumns, sharedColumns, sharedColumns, uniqueKeyColumns, valueArgs, whereArgs)
-		test.S(t).ExpectNil(err)
+		query, updateArgs, err := builder.BuildQuery(valueArgs, whereArgs)
+		require.NoError(t, err)
 		expected := `
 			update /* gh-ost mydb.tbl */
 			  mydb.tbl
@@ -672,8 +1098,299 @@ func TestBuildDMLUpdateQuerySignedUnsigned(t *testing.T) {
 				where
 					((position = ?))
 		`
-		test.S(t).ExpectEquals(normalizeQuery(query), normalizeQuery(expected))
-		test.S(t).ExpectTrue(reflect.DeepEqual(sharedArgs, []interface{}{3, "testname", int8(-17), uint8(254)}))
-		test.S(t).ExpectTrue(reflect.DeepEqual(uniqueKeyArgs, []interface{}{uint8(253)}))
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []interface{}{3, "testname", int8(-17), uint8(254), uint8(253)}, updateArgs)
 	}
+}
+
+func TestMoveTableCopySelectQueryBuilder(t *testing.T) {
+	t.Run("single column unique key", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+		uniqueKeyColumns := NewColumnList([]string{"id"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "PRIMARY", uniqueKeyColumns, true)
+		require.NoError(t, err)
+
+		query, args, err := builder.BuildQuery([]any{3}, []any{103})
+		require.NoError(t, err)
+
+		expected := `
+			select /* gh-ost mydb.tbl */ id, name, position
+			from
+				mydb.tbl
+			force index (PRIMARY)
+			where
+				(((id > ?) or ((id = ?))) and ((id < ?) or ((id = ?))))
+		`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []any{3, 3, 103, 103}, args)
+	})
+
+	t.Run("single column unique key without range start", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+		uniqueKeyColumns := NewColumnList([]string{"id"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "PRIMARY", uniqueKeyColumns, false)
+		require.NoError(t, err)
+
+		query, args, err := builder.BuildQuery([]any{3}, []any{103})
+		require.NoError(t, err)
+
+		expected := `
+			select /* gh-ost mydb.tbl */ id, name, position
+			from
+				mydb.tbl
+			force index (PRIMARY)
+			where
+				(((id > ?)) and ((id < ?) or ((id = ?))))
+		`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []any{3, 103, 103}, args)
+	})
+
+	t.Run("compound unique key", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "name_position_uidx", uniqueKeyColumns, true)
+		require.NoError(t, err)
+
+		query, args, err := builder.BuildQuery([]any{3, 17}, []any{103, 117})
+		require.NoError(t, err)
+
+		expected := `
+			select /* gh-ost mydb.tbl */ id, name, position
+			from
+				mydb.tbl
+			force index (name_position_uidx)
+			where
+				(((name > ?) or (((name = ?)) AND (position > ?)) or ((name = ?) and (position = ?)))
+				and ((name < ?) or (((name = ?)) AND (position < ?)) or ((name = ?) and (position = ?))))
+		`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []any{3, 3, 17, 3, 17, 103, 103, 117, 103, 117}, args)
+	})
+
+	t.Run("reuses prepared statement across calls", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name"})
+		uniqueKeyColumns := NewColumnList([]string{"id"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "PRIMARY", uniqueKeyColumns, true)
+		require.NoError(t, err)
+
+		query1, args1, err := builder.BuildQuery([]any{1}, []any{10})
+		require.NoError(t, err)
+		query2, args2, err := builder.BuildQuery([]any{11}, []any{20})
+		require.NoError(t, err)
+
+		require.Equal(t, query1, query2)
+		require.Equal(t, []any{1, 1, 10, 10}, args1)
+		require.Equal(t, []any{11, 11, 20, 20}, args2)
+	})
+
+	t.Run("wrong args count", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name"})
+		uniqueKeyColumns := NewColumnList([]string{"id"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "PRIMARY", uniqueKeyColumns, true)
+		require.NoError(t, err)
+
+		_, _, err = builder.BuildQuery([]any{1, 2}, []any{10})
+		require.Error(t, err)
+	})
+
+	t.Run("mismatched start and end args count", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+		uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+
+		builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "name_position_uidx", uniqueKeyColumns, true)
+		require.NoError(t, err)
+
+		// Total args count matches argsCount (4), but start and end counts differ.
+		_, _, err = builder.BuildQuery([]any{1, 2, 3}, []any{10})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "mismatched number of start and end args")
+	})
+}
+
+func BenchmarkMoveTableCopySelectQueryBuilderBuildQuery(b *testing.B) {
+	sharedColumns := NewColumnList([]string{"id", "name", "position"})
+	uniqueKeyColumns := NewColumnList([]string{"name", "position"})
+
+	builder, err := NewMoveTableCopySelectQueryBuilder("mydb", "tbl", sharedColumns, "name_position_uidx", uniqueKeyColumns, true)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	rangeStartArgs := []any{3, 17}
+	rangeEndArgs := []any{103, 117}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, err := builder.BuildQuery(rangeStartArgs, rangeEndArgs)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestMoveTableCopyInsertQueryBuilder(t *testing.T) {
+	t.Run("single row", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+
+		builder, err := NewMoveTableCopyInsertQueryBuilder("mydb", "ghost", sharedColumns)
+		require.NoError(t, err)
+
+		values := []*ColumnValues{
+			ToColumnValues([]interface{}{1, "alice", 10}),
+		}
+		query, args, err := builder.BuildQuery(values)
+		require.NoError(t, err)
+
+		expected := `
+			insert /* gh-ost mydb.ghost */ ignore
+			into
+				mydb.ghost
+				(id, name, position)
+			values
+			(?, ?, ?)
+		`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []any{1, "alice", 10}, args)
+	})
+
+	t.Run("multiple rows", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+
+		builder, err := NewMoveTableCopyInsertQueryBuilder("mydb", "ghost", sharedColumns)
+		require.NoError(t, err)
+
+		values := []*ColumnValues{
+			ToColumnValues([]interface{}{1, "alice", 10}),
+			ToColumnValues([]interface{}{2, "bob", 20}),
+			ToColumnValues([]interface{}{3, "carol", 30}),
+		}
+		query, args, err := builder.BuildQuery(values)
+		require.NoError(t, err)
+
+		expected := `
+			insert /* gh-ost mydb.ghost */ ignore
+			into
+				mydb.ghost
+				(id, name, position)
+			values
+			(?, ?, ?),
+			(?, ?, ?),
+			(?, ?, ?)
+		`
+		require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+		require.Equal(t, []any{1, "alice", 10, 2, "bob", 20, 3, "carol", 30}, args)
+	})
+
+	t.Run("wrong column count", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name", "position"})
+
+		builder, err := NewMoveTableCopyInsertQueryBuilder("mydb", "ghost", sharedColumns)
+		require.NoError(t, err)
+
+		values := []*ColumnValues{
+			ToColumnValues([]interface{}{1, "alice"}),
+		}
+		_, _, err = builder.BuildQuery(values)
+		require.Error(t, err)
+	})
+
+	t.Run("reuses prepared statement", func(t *testing.T) {
+		sharedColumns := NewColumnList([]string{"id", "name"})
+
+		builder, err := NewMoveTableCopyInsertQueryBuilder("mydb", "ghost", sharedColumns)
+		require.NoError(t, err)
+
+		values1 := []*ColumnValues{ToColumnValues([]interface{}{1, "a"})}
+		values2 := []*ColumnValues{ToColumnValues([]interface{}{2, "b"})}
+
+		query1, args1, err := builder.BuildQuery(values1)
+		require.NoError(t, err)
+		query2, args2, err := builder.BuildQuery(values2)
+		require.NoError(t, err)
+
+		require.Equal(t, query1, query2)
+		require.Equal(t, []any{1, "a"}, args1)
+		require.Equal(t, []any{2, "b"}, args2)
+	})
+}
+
+func BenchmarkMoveTableCopyInsertQueryBuilderBuildQuery(b *testing.B) {
+	sharedColumns := NewColumnList([]string{"id", "name", "position"})
+
+	builder, err := NewMoveTableCopyInsertQueryBuilder("mydb", "ghost", sharedColumns)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	values := []*ColumnValues{
+		ToColumnValues([]interface{}{1, "alice", 10}),
+		ToColumnValues([]interface{}{2, "bob", 20}),
+		ToColumnValues([]interface{}{3, "carol", 30}),
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, err := builder.BuildQuery(values)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestCheckpointQueryBuilder(t *testing.T) {
+	databaseName := "mydb"
+	tableName := "_tbl_ghk"
+	valueArgs := []interface{}{"mona", "mascot", int8(-17), "anothername", "anotherposition", int8(-2)}
+	uniqueKeyColumns := NewColumnList([]string{"name", "position", "my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长很长很长"})
+	builder, err := NewCheckpointQueryBuilder(databaseName, tableName, uniqueKeyColumns, false)
+	require.NoError(t, err)
+	query, uniqueKeyArgs, err := builder.BuildQuery(valueArgs)
+	require.NoError(t, err)
+	expected := `
+		insert /* gh-ost */ into mydb._tbl_ghk
+		(gh_ost_chk_timestamp, gh_ost_chk_coords, gh_ost_chk_iteration,
+		 gh_ost_rows_copied, gh_ost_dml_applied, gh_ost_is_cutover,
+		 name_min, position_min, my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长_min,
+		 name_max, position_max, my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长_max)
+		values
+		(unix_timestamp(now()), ?, ?,
+			 ?, ?, ?,
+			 ?, ?, ?,
+			 ?, ?, ?)
+    `
+	require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+	require.Equal(t, []interface{}{"mona", "mascot", int8(-17), "anothername", "anotherposition", int8(-2)}, uniqueKeyArgs)
+}
+
+func TestMoveTablesCheckpointQueryBuilder(t *testing.T) {
+	databaseName := "mydb"
+	tableName := "_tbl_ghk"
+	valueArgs := []interface{}{"mona", "mascot", int8(-17), "anothername", "anotherposition", int8(-2)}
+	uniqueKeyColumns := NewColumnList([]string{"name", "position", "my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长很长很长"})
+	builder, err := NewCheckpointQueryBuilder(databaseName, tableName, uniqueKeyColumns, true)
+	require.NoError(t, err)
+	query, uniqueKeyArgs, err := builder.BuildQuery(valueArgs)
+	require.NoError(t, err)
+	expected := `
+		insert /* gh-ost */ into mydb._tbl_ghk
+		(gh_ost_chk_timestamp, gh_ost_chk_coords, gh_ost_chk_iteration,
+		 gh_ost_rows_copied, gh_ost_dml_applied, gh_ost_is_cutover,
+		 gh_ost_move_tables_cutover_started, gh_ost_move_tables_drain_gtid,
+		 name_min, position_min, my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长_min,
+		 name_max, position_max, my_very_long_column_that_is_64_utf8_characters_long_很长很长很长很长_max)
+		values
+		(unix_timestamp(now()), ?, ?,
+			 ?, ?, ?,
+			 ?, ?,
+			 ?, ?, ?,
+			 ?, ?, ?)
+    `
+	require.Equal(t, normalizeQuery(expected), normalizeQuery(query))
+	require.Equal(t, []interface{}{"mona", "mascot", int8(-17), "anothername", "anotherposition", int8(-2)}, uniqueKeyArgs)
 }

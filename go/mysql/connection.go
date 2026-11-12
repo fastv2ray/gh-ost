@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -10,8 +10,9 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -22,12 +23,14 @@ const (
 
 // ConnectionConfig is the minimal configuration required to connect to a MySQL server
 type ConnectionConfig struct {
-	Key        InstanceKey
-	User       string
-	Password   string
-	ImpliedKey *InstanceKey
-	tlsConfig  *tls.Config
-	Timeout    float64
+	Key                  InstanceKey
+	User                 string
+	Password             string
+	ImpliedKey           *InstanceKey
+	tlsConfig            *tls.Config
+	Timeout              float64
+	TransactionIsolation string
+	Charset              string
 }
 
 func NewConnectionConfig() *ConnectionConfig {
@@ -39,31 +42,43 @@ func NewConnectionConfig() *ConnectionConfig {
 }
 
 // DuplicateCredentials creates a new connection config with given key and with same credentials as this config
-func (this *ConnectionConfig) DuplicateCredentials(key InstanceKey) *ConnectionConfig {
+func (con *ConnectionConfig) DuplicateCredentials(key InstanceKey) *ConnectionConfig {
 	config := &ConnectionConfig{
-		Key:       key,
-		User:      this.User,
-		Password:  this.Password,
-		tlsConfig: this.tlsConfig,
-		Timeout:   this.Timeout,
+		Key:                  key,
+		User:                 con.User,
+		Password:             con.Password,
+		tlsConfig:            con.tlsConfig,
+		Timeout:              con.Timeout,
+		TransactionIsolation: con.TransactionIsolation,
+		Charset:              con.Charset,
 	}
+
+	if con.tlsConfig != nil {
+		config.tlsConfig = &tls.Config{
+			ServerName:         key.Hostname,
+			Certificates:       con.tlsConfig.Certificates,
+			RootCAs:            con.tlsConfig.RootCAs,
+			InsecureSkipVerify: con.tlsConfig.InsecureSkipVerify,
+		}
+	}
+
 	config.ImpliedKey = &config.Key
 	return config
 }
 
-func (this *ConnectionConfig) Duplicate() *ConnectionConfig {
-	return this.DuplicateCredentials(this.Key)
+func (con *ConnectionConfig) Duplicate() *ConnectionConfig {
+	return con.DuplicateCredentials(con.Key)
 }
 
-func (this *ConnectionConfig) String() string {
-	return fmt.Sprintf("%s, user=%s, usingTLS=%t", this.Key.DisplayString(), this.User, this.tlsConfig != nil)
+func (con *ConnectionConfig) String() string {
+	return fmt.Sprintf("%s, user=%s, usingTLS=%t", con.Key.DisplayString(), con.User, con.tlsConfig != nil)
 }
 
-func (this *ConnectionConfig) Equals(other *ConnectionConfig) bool {
-	return this.Key.Equals(&other.Key) || this.ImpliedKey.Equals(other.ImpliedKey)
+func (con *ConnectionConfig) Equals(other *ConnectionConfig) bool {
+	return con.Key.Equals(&other.Key) || con.ImpliedKey.Equals(other.ImpliedKey)
 }
 
-func (this *ConnectionConfig) UseTLS(caCertificatePath, clientCertificate, clientKey string, allowInsecure bool) error {
+func (con *ConnectionConfig) UseTLS(caCertificatePath, clientCertificate, clientKey string, allowInsecure bool) error {
 	var rootCertPool *x509.CertPool
 	var certs []tls.Certificate
 	var err error
@@ -75,7 +90,7 @@ func (this *ConnectionConfig) UseTLS(caCertificatePath, clientCertificate, clien
 		}
 	} else {
 		rootCertPool = x509.NewCertPool()
-		pem, err := ioutil.ReadFile(caCertificatePath)
+		pem, err := os.ReadFile(caCertificatePath)
 		if err != nil {
 			return err
 		}
@@ -91,33 +106,66 @@ func (this *ConnectionConfig) UseTLS(caCertificatePath, clientCertificate, clien
 		certs = []tls.Certificate{cert}
 	}
 
-	this.tlsConfig = &tls.Config{
-		ServerName:         this.Key.Hostname,
+	con.tlsConfig = &tls.Config{
+		ServerName:         con.Key.Hostname,
 		Certificates:       certs,
 		RootCAs:            rootCertPool,
 		InsecureSkipVerify: allowInsecure,
 	}
 
-	return mysql.RegisterTLSConfig(TLS_CONFIG_KEY, this.tlsConfig)
+	return con.RegisterTLSConfig()
 }
 
-func (this *ConnectionConfig) TLSConfig() *tls.Config {
-	return this.tlsConfig
+func (con *ConnectionConfig) RegisterTLSConfig() error {
+	if con.tlsConfig == nil {
+		return nil
+	}
+	if con.tlsConfig.ServerName == "" {
+		return errors.New("tlsConfig.ServerName cannot be empty")
+	}
+
+	var tlsOption = GetDBTLSConfigKey(con.tlsConfig.ServerName)
+
+	return mysql.RegisterTLSConfig(tlsOption, con.tlsConfig)
 }
 
-func (this *ConnectionConfig) GetDBUri(databaseName string) string {
-	hostname := this.Key.Hostname
+func (con *ConnectionConfig) TLSConfig() *tls.Config {
+	return con.tlsConfig
+}
+
+func (con *ConnectionConfig) GetDBUri(databaseName string) string {
+	hostname := con.Key.Hostname
 	var ip = net.ParseIP(hostname)
 	if (ip != nil) && (ip.To4() == nil) {
 		// Wrap IPv6 literals in square brackets
 		hostname = fmt.Sprintf("[%s]", hostname)
 	}
-	interpolateParams := true
+
 	// go-mysql-driver defaults to false if tls param is not provided; explicitly setting here to
 	// simplify construction of the DSN below.
 	tlsOption := "false"
-	if this.tlsConfig != nil {
-		tlsOption = TLS_CONFIG_KEY
+	if con.tlsConfig != nil {
+		tlsOption = GetDBTLSConfigKey(con.tlsConfig.ServerName)
 	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?timeout=%fs&readTimeout=%fs&writeTimeout=%fs&interpolateParams=%t&autocommit=true&charset=utf8mb4,utf8,latin1&tls=%s", this.User, this.Password, hostname, this.Key.Port, databaseName, this.Timeout, this.Timeout, this.Timeout, interpolateParams, tlsOption)
+
+	if con.Charset == "" {
+		con.Charset = "utf8mb4,utf8,latin1"
+	}
+
+	connectionParams := []string{
+		"autocommit=true",
+		"interpolateParams=true",
+		fmt.Sprintf("charset=%s", con.Charset),
+		fmt.Sprintf("tls=%s", tlsOption),
+		fmt.Sprintf("transaction_isolation=%q", con.TransactionIsolation),
+		fmt.Sprintf("timeout=%fs", con.Timeout),
+		fmt.Sprintf("readTimeout=%fs", con.Timeout),
+		fmt.Sprintf("writeTimeout=%fs", con.Timeout),
+	}
+
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", con.User, con.Password, hostname, con.Key.Port, databaseName, strings.Join(connectionParams, "&"))
+}
+
+func GetDBTLSConfigKey(tlsServerName string) string {
+	return fmt.Sprintf("%s-%s", TLS_CONFIG_KEY, tlsServerName)
 }

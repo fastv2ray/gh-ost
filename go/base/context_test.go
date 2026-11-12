@@ -6,14 +6,15 @@
 package base
 
 import (
-	"fmt"
-	"io/ioutil"
+	"errors"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/openark/golib/log"
-	test "github.com/openark/golib/tests"
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -24,22 +25,22 @@ func TestGetTableNames(t *testing.T) {
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "some_table"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_some_table_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_some_table_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_some_table_ghc")
+		require.Equal(t, "_some_table_del", context.GetOldTableName())
+		require.Equal(t, "_some_table_gho", context.GetGhostTableName())
+		require.Equal(t, "_some_table_ghc", context.GetChangelogTableName(), "_some_table_ghc")
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "a123456789012345678901234567890123456789012345678901234567890"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_a1234567890123456789012345678901234567890123456789012345678_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_a1234567890123456789012345678901234567890123456789012345678_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_a1234567890123456789012345678901234567890123456789012345678_ghc")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_del", context.GetOldTableName())
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_gho", context.GetGhostTableName())
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_ghc", context.GetChangelogTableName())
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "a123456789012345678901234567890123456789012345678901234567890123"
 		oldTableName := context.GetOldTableName()
-		test.S(t).ExpectEquals(oldTableName, "_a1234567890123456789012345678901234567890123456789012345678_del")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123456789012345678_del", oldTableName)
 	}
 	{
 		context := NewMigrationContext()
@@ -48,15 +49,146 @@ func TestGetTableNames(t *testing.T) {
 		longForm := "Jan 2, 2006 at 3:04pm (MST)"
 		context.StartTime, _ = time.Parse(longForm, "Feb 3, 2013 at 7:54pm (PST)")
 		oldTableName := context.GetOldTableName()
-		test.S(t).ExpectEquals(oldTableName, "_a1234567890123456789012345678901234567890123_20130203195400_del")
+		require.Equal(t, "_a1234567890123456789012345678901234567890123_20130203195400_del", oldTableName)
 	}
 	{
 		context := NewMigrationContext()
 		context.OriginalTableName = "foo_bar_baz"
 		context.ForceTmpTableName = "tmp"
-		test.S(t).ExpectEquals(context.GetOldTableName(), "_tmp_del")
-		test.S(t).ExpectEquals(context.GetGhostTableName(), "_tmp_gho")
-		test.S(t).ExpectEquals(context.GetChangelogTableName(), "_tmp_ghc")
+		require.Equal(t, "_tmp_del", context.GetOldTableName())
+		require.Equal(t, "_tmp_gho", context.GetGhostTableName())
+		require.Equal(t, "_tmp_ghc", context.GetChangelogTableName())
+	}
+}
+
+func TestMoveTableDelName(t *testing.T) {
+	context := NewMigrationContext()
+	// Per-table `_<table>_del` rollback handle, independent of any other table.
+	require.Equal(t, "_some_table_del", context.MoveTableDelName("some_table"))
+	require.Equal(t, "_other_del", context.MoveTableDelName("other"))
+
+	// Honors --timestamp-old-table like the single-table GetOldTableName does.
+	context.TimestampOldTable = true
+	longForm := "Jan 2, 2006 at 3:04pm (MST)"
+	context.StartTime, _ = time.Parse(longForm, "Feb 3, 2013 at 7:54pm (PST)")
+	require.Equal(t, "_some_table_20130203195400_del", context.MoveTableDelName("some_table"))
+}
+
+func TestMoveTablesRunToken(t *testing.T) {
+	// Empty outside move-tables mode.
+	require.Equal(t, "", NewMigrationContext().MoveTablesRunToken())
+
+	context := NewMigrationContext()
+	context.MoveTables.TableNames = []string{"a", "b", "c"}
+	token := context.MoveTablesRunToken()
+	// Fixed length, lowercase hex (12 chars / 48 bits).
+	require.Len(t, token, 12)
+	require.Regexp(t, "^[0-9a-f]{12}$", token)
+	// Deterministic: the same set always yields the same token (so a resumed run
+	// finds the same run-wide artifacts).
+	require.Equal(t, token, context.MoveTablesRunToken())
+
+	// Order-independent: --move-tables=a,b,c and =c,b,a match.
+	reordered := NewMigrationContext()
+	reordered.MoveTables.TableNames = []string{"c", "b", "a"}
+	require.Equal(t, token, reordered.MoveTablesRunToken())
+
+	// A different set yields a different token.
+	different := NewMigrationContext()
+	different.MoveTables.TableNames = []string{"a", "b", "d"}
+	require.NotEqual(t, token, different.MoveTablesRunToken())
+}
+
+func TestGetTriggerNames(t *testing.T) {
+	{
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_gho"
+		require.Equal(t, "my_trigger"+context.TriggerSuffix, context.GetGhostTriggerName("my_trigger"))
+	}
+	{
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_gho"
+		context.RemoveTriggerSuffix = true
+		require.Equal(t, "my_trigger"+context.TriggerSuffix, context.GetGhostTriggerName("my_trigger"))
+	}
+	{
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_gho"
+		context.RemoveTriggerSuffix = true
+		require.Equal(t, "my_trigger", context.GetGhostTriggerName("my_trigger_gho"))
+	}
+	{
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_gho"
+		context.RemoveTriggerSuffix = false
+		require.Equal(t, "my_trigger_gho_gho", context.GetGhostTriggerName("my_trigger_gho"))
+	}
+}
+
+func TestValidateGhostTriggerLengthBelowMaxLength(t *testing.T) {
+	// Tests simulate the real call pattern: GetGhostTriggerName first, then validate the result.
+	{
+		// Short trigger name with suffix appended: well under 64 chars
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_gho"
+		ghostName := context.GetGhostTriggerName("my_trigger") // "my_trigger_gho" = 14 chars
+		require.True(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// 64-char original + "_ghost" suffix = 70 chars → exceeds limit
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ghost"
+		ghostName := context.GetGhostTriggerName(strings.Repeat("my_trigger_ghost", 4)) // 64 + 6 = 70
+		require.False(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// 48-char original + "_ghost" suffix = 54 chars → valid
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ghost"
+		ghostName := context.GetGhostTriggerName(strings.Repeat("my_trigger_ghost", 3)) // 48 + 6 = 54
+		require.True(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// RemoveTriggerSuffix: 64-char name ending in "_ghost" → suffix removed → 58 chars → valid
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ghost"
+		context.RemoveTriggerSuffix = true
+		ghostName := context.GetGhostTriggerName(strings.Repeat("my_trigger_ghost", 4)) // suffix removed → 58
+		require.True(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// RemoveTriggerSuffix: name doesn't end in suffix → suffix appended → 65 + 6 = 71 chars → exceeds
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ghost"
+		context.RemoveTriggerSuffix = true
+		ghostName := context.GetGhostTriggerName(strings.Repeat("my_trigger_ghost", 4) + "X") // no match, appended → 71
+		require.False(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// RemoveTriggerSuffix: 70-char name ending in "_ghost" → suffix removed → 64 chars → exactly at limit → valid
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ghost"
+		context.RemoveTriggerSuffix = true
+		ghostName := context.GetGhostTriggerName(strings.Repeat("my_trigger_ghost", 4) + "_ghost") // suffix removed → 64
+		require.True(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// Edge case: exactly 64 chars after transformation → valid (boundary test)
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ght"
+		originalName := strings.Repeat("x", 60)                // 60 chars
+		ghostName := context.GetGhostTriggerName(originalName) // 60 + 4 = 64
+		require.Equal(t, 64, len(ghostName))
+		require.True(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
+	}
+	{
+		// Edge case: 65 chars after transformation → exceeds (boundary test)
+		context := NewMigrationContext()
+		context.TriggerSuffix = "_ght"
+		originalName := strings.Repeat("x", 61)                // 61 chars
+		ghostName := context.GetGhostTriggerName(originalName) // 61 + 4 = 65
+		require.Equal(t, 65, len(ghostName))
+		require.False(t, context.ValidateGhostTriggerLengthBelowMaxLength(ghostName))
 	}
 }
 
@@ -69,7 +201,7 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
@@ -83,13 +215,13 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
 		defer os.Remove(f.Name())
 
-		f.Write([]byte(fmt.Sprintf("[client]\nuser=test\npassword=123456")))
+		f.Write([]byte("[client]\nuser=test\npassword=123456"))
 		context := NewMigrationContext()
 		context.ConfigFile = f.Name()
 		if err := context.ReadConfigFile(); err != nil {
@@ -103,13 +235,13 @@ func TestReadConfigFile(t *testing.T) {
 		}
 	}
 	{
-		f, err := ioutil.TempFile("", t.Name())
+		f, err := os.CreateTemp("", t.Name())
 		if err != nil {
 			t.Fatalf("Failed to create tmp file: %v", err)
 		}
 		defer os.Remove(f.Name())
 
-		f.Write([]byte(fmt.Sprintf("[osc]\nmax_load=10")))
+		f.Write([]byte("[osc]\nmax_load=10"))
 		context := NewMigrationContext()
 		context.ConfigFile = f.Name()
 		if err := context.ReadConfigFile(); err != nil {
@@ -119,5 +251,135 @@ func TestReadConfigFile(t *testing.T) {
 		if context.config.Osc.Max_Load != "10" {
 			t.Fatalf("Expected osc 'max_load' %q, got %q", "10", context.config.Osc.Max_Load)
 		}
+	}
+}
+
+func TestApplyCredentialsMoveTablesDerivesConnectionConfig(t *testing.T) {
+	ctx := NewMigrationContext()
+	ctx.MoveTables.TableNames = []string{"some_table"}
+	ctx.MoveTables.TargetHost = "target-host"
+	ctx.MoveTables.TargetPort = 3307
+	ctx.MoveTables.TargetUser = "target-user"
+	ctx.MoveTables.TargetPass = "target-pass"
+
+	ctx.InspectorConnectionConfig.Key.Hostname = "source-host"
+	ctx.InspectorConnectionConfig.Key.Port = 3306
+	ctx.InspectorConnectionConfig.User = "source-user"
+	ctx.InspectorConnectionConfig.Password = "source-pass"
+	ctx.InspectorConnectionConfig.Timeout = 12.5
+	ctx.InspectorConnectionConfig.TransactionIsolation = "REPEATABLE-READ"
+	ctx.InspectorConnectionConfig.Charset = "utf8mb4"
+
+	ctx.ApplyCredentials()
+
+	got := ctx.MoveTables.ConnectionConfig
+	require.NotNil(t, got)
+	require.Equal(t, "target-host", got.Key.Hostname)
+	require.Equal(t, 3307, got.Key.Port)
+	require.Equal(t, "target-user", got.User)
+	require.Equal(t, "target-pass", got.Password)
+	require.Equal(t, 12.5, got.Timeout)
+	require.Equal(t, "REPEATABLE-READ", got.TransactionIsolation)
+	require.Equal(t, "utf8mb4", got.Charset)
+	require.NotNil(t, got.ImpliedKey)
+	require.Equal(t, "target-host", got.ImpliedKey.Hostname)
+	require.Equal(t, 3307, got.ImpliedKey.Port)
+}
+
+func TestSetupTLSAppliesToMoveTablesConfig(t *testing.T) {
+	ctx := NewMigrationContext()
+	ctx.UseTLS = true
+	ctx.TLSAllowInsecure = true
+	ctx.MoveTables.TableNames = []string{"some_table"}
+	ctx.MoveTables.TargetHost = "target-host"
+	ctx.MoveTables.TargetPort = 3307
+	ctx.MoveTables.TargetUser = "target-user"
+	ctx.MoveTables.TargetPass = "target-pass"
+
+	ctx.InspectorConnectionConfig.Key.Hostname = "source-host"
+	ctx.InspectorConnectionConfig.Key.Port = 3306
+	ctx.InspectorConnectionConfig.User = "source-user"
+	ctx.InspectorConnectionConfig.Password = "source-pass"
+
+	ctx.ApplyCredentials()
+	require.NoError(t, ctx.SetupTLS())
+
+	require.NotNil(t, ctx.InspectorConnectionConfig.TLSConfig())
+	require.NotNil(t, ctx.MoveTables.ConnectionConfig.TLSConfig())
+	require.Equal(t, "source-host", ctx.InspectorConnectionConfig.TLSConfig().ServerName)
+	require.Equal(t, "target-host", ctx.MoveTables.ConnectionConfig.TLSConfig().ServerName)
+}
+
+func TestSetAbortError_StoresFirstError(t *testing.T) {
+	ctx := NewMigrationContext()
+
+	err1 := errors.New("first error")
+	err2 := errors.New("second error")
+
+	ctx.SetAbortError(err1)
+	ctx.SetAbortError(err2)
+
+	got := ctx.GetAbortError()
+	if got != err1 { //nolint:errorlint // Testing pointer equality for sentinel error
+		t.Errorf("Expected first error %v, got %v", err1, got)
+	}
+}
+
+func TestSetAbortError_ThreadSafe(t *testing.T) {
+	ctx := NewMigrationContext()
+
+	var wg sync.WaitGroup
+	errs := []error{
+		errors.New("error 1"),
+		errors.New("error 2"),
+		errors.New("error 3"),
+	}
+
+	// Launch 3 goroutines trying to set error concurrently
+	for _, err := range errs {
+		wg.Add(1)
+		go func(e error) {
+			defer wg.Done()
+			ctx.SetAbortError(e)
+		}(err)
+	}
+
+	wg.Wait()
+
+	// Should store exactly one of the errors
+	got := ctx.GetAbortError()
+	if got == nil {
+		t.Fatal("Expected error to be stored, got nil")
+	}
+
+	// Verify it's one of the errors we sent
+	found := false
+	for _, err := range errs {
+		if got == err { //nolint:errorlint // Testing pointer equality for sentinel error
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Stored error %v not in list of sent errors", got)
+	}
+}
+
+func TestSetCutOverLockTimeoutSecondsRangeByMode(t *testing.T) {
+	{
+		ctx := NewMigrationContext()
+		require.NoError(t, ctx.SetCutOverLockTimeoutSeconds(10))
+		err := ctx.SetCutOverLockTimeoutSeconds(11)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "maximal timeout is 10sec")
+	}
+
+	{
+		ctx := NewMigrationContext()
+		ctx.MoveTables.TableNames = []string{"tbl"}
+		require.NoError(t, ctx.SetCutOverLockTimeoutSeconds(60))
+		err := ctx.SetCutOverLockTimeoutSeconds(61)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "maximal timeout is 60sec")
 	}
 }

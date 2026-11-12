@@ -1,13 +1,14 @@
+//nolint:revive // legacy MySQL/MariaDB binlog protocol constants (LOG_EVENT_*, BINLOG_*, MARIADB_*, COM_*, etc.) are kept verbatim from the upstream protocol for backward compatibility
 package replication
 
 const (
-	//we only support MySQL 5.0.0+ binlog format, maybe???
+	// we only support MySQL 5.0.0+ binlog format, maybe???
 	MinBinlogVersion = 4
 )
 
 var (
-	//binlog header [ fe `bin` ]
-	BinLogFileHeader []byte = []byte{0xfe, 0x62, 0x69, 0x6e}
+	// binlog header [ fe `bin` ]
+	BinLogFileHeader = []byte{0xfe, 0x62, 0x69, 0x6e}
 
 	SemiSyncIndicator byte = 0xef
 )
@@ -35,7 +36,7 @@ const (
 
 const (
 	BINLOG_ROW_IMAGE_FULL    = "FULL"
-	BINLOG_ROW_IAMGE_MINIMAL = "MINIMAL"
+	BINLOG_ROW_IMAGE_MINIMAL = "MINIMAL"
 	BINLOG_ROW_IMAGE_NOBLOB  = "NOBLOB"
 )
 
@@ -47,6 +48,9 @@ const (
 	BINLOG_MARIADB_FL_WAITED                      /*16 = FL_WAITED is set if a row lock wait (or other wait) is detected during the execution of the transaction*/
 	BINLOG_MARIADB_FL_DDL                         /*32 - FL_DDL is set for event group containing DDL*/
 )
+
+// See `Log_event_type` in binlog_event.h
+// https://github.com/mysql/mysql-server/blob/trunk/libs/mysql/binlog/event/binlog_event.h
 
 type EventType byte
 
@@ -90,6 +94,10 @@ const (
 	TRANSACTION_CONTEXT_EVENT
 	VIEW_CHANGE_EVENT
 	XA_PREPARE_LOG_EVENT
+	PARTIAL_UPDATE_ROWS_EVENT
+	TRANSACTION_PAYLOAD_EVENT
+	HEARTBEAT_LOG_EVENT_V2
+	GTID_TAGGED_LOG_EVENT
 )
 
 const (
@@ -98,6 +106,11 @@ const (
 	MARIADB_BINLOG_CHECKPOINT_EVENT
 	MARIADB_GTID_EVENT
 	MARIADB_GTID_LIST_EVENT
+	MARIADB_START_ENCRYPTION_EVENT
+	MARIADB_QUERY_COMPRESSED_EVENT
+	MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1
+	MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1
+	MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1
 )
 
 func (e EventType) String() string {
@@ -188,20 +201,51 @@ func (e EventType) String() string {
 		return "ViewChangeEvent"
 	case XA_PREPARE_LOG_EVENT:
 		return "XAPrepareLogEvent"
+	case PARTIAL_UPDATE_ROWS_EVENT:
+		return "PartialUpdateRowsEvent"
+	case TRANSACTION_PAYLOAD_EVENT:
+		return "TransactionPayloadEvent"
+	case HEARTBEAT_LOG_EVENT_V2:
+		return "HeartbeatLogEventV2"
+	case GTID_TAGGED_LOG_EVENT:
+		return "Gtid_tagged_log_event"
+	case MARIADB_START_ENCRYPTION_EVENT:
+		return "MariadbStartEncryptionEvent"
+	case MARIADB_QUERY_COMPRESSED_EVENT:
+		return "MariadbQueryCompressedEvent"
+	case MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
+		return "MariadbWriteRowsCompressedEventV1"
+	case MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
+		return "MariadbUpdateRowsCompressedEventV1"
+	case MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
+		return "MariadbDeleteRowsCompressedEventV1"
 
 	default:
 		return "UnknownEvent"
 	}
 }
 
+type BinlogChecksum byte
+
 const (
-	BINLOG_CHECKSUM_ALG_OFF byte = 0 // Events are without checksum though its generator
+	BINLOG_CHECKSUM_ALG_OFF BinlogChecksum = 0 // Events are without checksum though its generator
 	// is checksum-capable New Master (NM).
-	BINLOG_CHECKSUM_ALG_CRC32 byte = 1 // CRC32 of zlib algorithm.
+	BINLOG_CHECKSUM_ALG_CRC32 BinlogChecksum = 1 // CRC32 of zlib algorithm.
 	//  BINLOG_CHECKSUM_ALG_ENUM_END,  // the cut line: valid alg range is [1, 0x7f].
-	BINLOG_CHECKSUM_ALG_UNDEF byte = 255 // special value to tag undetermined yet checksum
+	BINLOG_CHECKSUM_ALG_UNDEF BinlogChecksum = 255 // special value to tag undetermined yet checksum
 	// or events from checksum-unaware servers
 )
+
+func (e BinlogChecksum) String() string {
+	switch e {
+	case BINLOG_CHECKSUM_ALG_OFF:
+		return "CHECKSUM_OFF"
+	case BINLOG_CHECKSUM_ALG_CRC32:
+		return "CHECKSUM_CRC32"
+	default:
+		return "CHECKSUM_UNDEF"
+	}
+}
 
 // These are TABLE_MAP_EVENT's optional metadata field type, from: libbinlogevents/include/rows_event.h
 const (
@@ -216,4 +260,44 @@ const (
 	TABLE_MAP_OPT_META_PRIMARY_KEY_WITH_PREFIX
 	TABLE_MAP_OPT_META_ENUM_AND_SET_DEFAULT_CHARSET
 	TABLE_MAP_OPT_META_ENUM_AND_SET_COLUMN_CHARSET
+	TABLE_MAP_OPT_META_COLUMN_VISIBILITY
+)
+
+type IntVarEventType byte
+
+const (
+	INVALID IntVarEventType = iota
+	LAST_INSERT_ID
+	INSERT_ID
+)
+
+const (
+	ENUM_EXTRA_ROW_INFO_TYPECODE_NDB byte = iota
+	ENUM_EXTRA_ROW_INFO_TYPECODE_PARTITION
+)
+
+// Binlog flags, from include/mysql.h
+const (
+	USE_HEARTBEAT_EVENT_V2      = 1 << 1
+	MYSQL_RPL_SKIP_TAGGED_GTIDS = 1 << 2
+	MYSQL_RPL_GTID              = 1 << 16
+	MYSQL_RPL_SKIP_HEARTBEAT    = 1 << 17
+)
+
+// On-The-Wire HeartBeat fields
+// See enum mysql::binlog::event::codecs::binary::Heartbeat::fields in MySQL
+const (
+	OTW_HB_HEADER_END_MARK = iota
+	OTW_HB_LOG_FILENAME_FIELD
+	OTW_HB_LOG_POSITION_FIELD
+)
+
+// Constants for binlog event flags
+// Source: https://github.com/mysql/mysql-server/blob/447eb26e094b444a88c532028647e48228c3c04f/libs/mysql/binlog/event/rows_event.h#L891-L910
+const (
+	STMT_END_F = 1 << iota
+	NO_FOREIGN_KEY_CHECKS_F
+	RELAXED_UNIQUE_CHECKS_F
+	COMPLETE_ROWS_F
+	USE_SQL_FOREIGN_KEY_F
 )

@@ -2,23 +2,34 @@ name: "CodeQL analysis"
 
 on: 
   push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
   schedule:
-    - cron: '0 0 * * 0'
+    - cron: '25 22 * * 6'
 
 jobs:
   codeql:
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
 
     strategy:
       fail-fast: false
+      matrix:
+        language: [ 'actions', 'go' ]
 
     runs-on: ubuntu-latest # windows-latest and ubuntu-latest are supported. macos-latest is not supported at this time. 
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         
     - name: Initialize CodeQL 
-      uses: github/codeql-action/init@v1
+      uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+      with:
+          languages: ${{ matrix.language }}
     
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v1
+      uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0

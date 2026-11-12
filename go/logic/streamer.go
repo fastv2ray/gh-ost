@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -23,12 +23,12 @@ type BinlogEventListener struct {
 	async        bool
 	databaseName string
 	tableName    string
-	onDmlEvent   func(event *binlog.BinlogDMLEvent) error
+	onDmlEvent   func(event *binlog.BinlogEntry) error
 }
 
 const (
 	EventsChannelBufferSize       = 1
-	ReconnectStreamerSleepSeconds = 5
+	ReconnectStreamerSleepSeconds = 1
 )
 
 // EventsStreamer reads data from binary logs and streams it on. It acts as a publisher,
@@ -36,8 +36,9 @@ const (
 type EventsStreamer struct {
 	connectionConfig         *mysql.ConnectionConfig
 	db                       *gosql.DB
+	dbVersion                string
 	migrationContext         *base.MigrationContext
-	initialBinlogCoordinates *mysql.BinlogCoordinates
+	initialBinlogCoordinates mysql.BinlogCoordinates
 	listeners                [](*BinlogEventListener)
 	listenersMutex           *sync.Mutex
 	eventsChannel            chan *binlog.BinlogEntry
@@ -47,27 +48,27 @@ type EventsStreamer struct {
 
 func NewEventsStreamer(migrationContext *base.MigrationContext) *EventsStreamer {
 	return &EventsStreamer{
-		connectionConfig: migrationContext.InspectorConnectionConfig,
-		migrationContext: migrationContext,
-		listeners:        [](*BinlogEventListener){},
-		listenersMutex:   &sync.Mutex{},
-		eventsChannel:    make(chan *binlog.BinlogEntry, EventsChannelBufferSize),
-		name:             "streamer",
+		connectionConfig:         migrationContext.InspectorConnectionConfig,
+		migrationContext:         migrationContext,
+		listeners:                [](*BinlogEventListener){},
+		listenersMutex:           &sync.Mutex{},
+		eventsChannel:            make(chan *binlog.BinlogEntry, EventsChannelBufferSize),
+		name:                     "streamer",
+		initialBinlogCoordinates: migrationContext.InitialStreamerCoords,
 	}
 }
 
 // AddListener registers a new listener for binlog events, on a per-table basis
-func (this *EventsStreamer) AddListener(
-	async bool, databaseName string, tableName string, onDmlEvent func(event *binlog.BinlogDMLEvent) error) (err error) {
-
-	this.listenersMutex.Lock()
-	defer this.listenersMutex.Unlock()
+func (es *EventsStreamer) AddListener(
+	async bool, databaseName string, tableName string, onDmlEvent func(event *binlog.BinlogEntry) error) (err error) {
+	es.listenersMutex.Lock()
+	defer es.listenersMutex.Unlock()
 
 	if databaseName == "" {
-		return fmt.Errorf("Empty database name in AddListener")
+		return fmt.Errorf("empty database name in AddListener")
 	}
 	if tableName == "" {
-		return fmt.Errorf("Empty table name in AddListener")
+		return fmt.Errorf("empty table name in AddListener")
 	}
 	listener := &BinlogEventListener{
 		async:        async,
@@ -75,46 +76,69 @@ func (this *EventsStreamer) AddListener(
 		tableName:    tableName,
 		onDmlEvent:   onDmlEvent,
 	}
-	this.listeners = append(this.listeners, listener)
+	es.listeners = append(es.listeners, listener)
 	return nil
+}
+
+// shouldDecodeRowsEvent returns true when at least one listener is registered for
+// the table on which the rows event operates. This is used by the binlog parser
+// after it decodes the row event header/table map, but before it decodes row data.
+func (es *EventsStreamer) shouldDecodeRowsEvent(databaseName, tableName string) bool {
+	es.listenersMutex.Lock()
+	defer es.listenersMutex.Unlock()
+
+	for _, listener := range es.listeners {
+		if !strings.EqualFold(listener.databaseName, databaseName) {
+			continue
+		}
+		if !strings.EqualFold(listener.tableName, tableName) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // notifyListeners will notify relevant listeners with given DML event. Only
 // listeners registered for changes on the table on which the DML operates are notified.
-func (this *EventsStreamer) notifyListeners(binlogEvent *binlog.BinlogDMLEvent) {
-	this.listenersMutex.Lock()
-	defer this.listenersMutex.Unlock()
+func (es *EventsStreamer) notifyListeners(binlogEntry *binlog.BinlogEntry) {
+	es.listenersMutex.Lock()
+	defer es.listenersMutex.Unlock()
 
-	for _, listener := range this.listeners {
+	for _, listener := range es.listeners {
 		listener := listener
-		if strings.ToLower(listener.databaseName) != strings.ToLower(binlogEvent.DatabaseName) {
+		if !strings.EqualFold(listener.databaseName, binlogEntry.DmlEvent.DatabaseName) {
 			continue
 		}
-		if strings.ToLower(listener.tableName) != strings.ToLower(binlogEvent.TableName) {
+		if !strings.EqualFold(listener.tableName, binlogEntry.DmlEvent.TableName) {
 			continue
 		}
 		if listener.async {
 			go func() {
-				listener.onDmlEvent(binlogEvent)
+				listener.onDmlEvent(binlogEntry)
 			}()
 		} else {
-			listener.onDmlEvent(binlogEvent)
+			listener.onDmlEvent(binlogEntry)
 		}
 	}
 }
 
-func (this *EventsStreamer) InitDBConnections() (err error) {
-	EventsStreamerUri := this.connectionConfig.GetDBUri(this.migrationContext.DatabaseName)
-	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, EventsStreamerUri); err != nil {
+func (es *EventsStreamer) InitDBConnections() (err error) {
+	EventsStreamerUri := es.connectionConfig.GetDBUri(es.migrationContext.DatabaseName)
+	if es.db, _, err = mysql.GetDB(es.migrationContext.Uuid, EventsStreamerUri); err != nil {
 		return err
 	}
-	if _, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name); err != nil {
+	version, err := base.ValidateConnection(es.db, es.connectionConfig, es.migrationContext, es.name)
+	if err != nil {
 		return err
 	}
-	if err := this.readCurrentBinlogCoordinates(); err != nil {
-		return err
+	es.dbVersion = version
+	if es.initialBinlogCoordinates == nil || es.initialBinlogCoordinates.IsEmpty() {
+		if err := es.readCurrentBinlogCoordinates(); err != nil {
+			return err
+		}
 	}
-	if err := this.initBinlogReader(this.initialBinlogCoordinates); err != nil {
+	if err := es.initBinlogReader(es.initialBinlogCoordinates); err != nil {
 		return err
 	}
 
@@ -122,103 +146,139 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 }
 
 // initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
-func (this *EventsStreamer) initBinlogReader(binlogCoordinates *mysql.BinlogCoordinates) error {
-	goMySQLReader, err := binlog.NewGoMySQLReader(this.migrationContext)
-	if err != nil {
+func (es *EventsStreamer) initBinlogReader(binlogCoordinates mysql.BinlogCoordinates) error {
+	goMySQLReader := binlog.NewGoMySQLReader(es.migrationContext, es.shouldDecodeRowsEvent)
+	if err := goMySQLReader.ConnectBinlogStreamer(binlogCoordinates); err != nil {
 		return err
 	}
-	if err := goMySQLReader.ConnectBinlogStreamer(*binlogCoordinates); err != nil {
-		return err
-	}
-	this.binlogReader = goMySQLReader
+	es.binlogReader = goMySQLReader
 	return nil
 }
 
-func (this *EventsStreamer) GetCurrentBinlogCoordinates() *mysql.BinlogCoordinates {
-	return this.binlogReader.GetCurrentBinlogCoordinates()
-}
-
-func (this *EventsStreamer) GetReconnectBinlogCoordinates() *mysql.BinlogCoordinates {
-	return &mysql.BinlogCoordinates{LogFile: this.GetCurrentBinlogCoordinates().LogFile, LogPos: 4}
+func (es *EventsStreamer) GetCurrentBinlogCoordinates() mysql.BinlogCoordinates {
+	return es.binlogReader.GetCurrentBinlogCoordinates()
 }
 
 // readCurrentBinlogCoordinates reads master status from hooked server
-func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
-	query := `show /* gh-ost readCurrentBinlogCoordinates */ master status`
+func (es *EventsStreamer) readCurrentBinlogCoordinates() error {
+	// MariaDB exposes no GTID column in SHOW MASTER STATUS; its current binlog
+	// GTID position lives in @@global.gtid_binlog_pos.
+	if es.migrationContext.UseGTIDs && mysql.IsMariaDB(es.dbVersion) {
+		return es.readCurrentMariaDBGTIDCoordinates()
+	}
+	binaryLogStatusTerm := mysql.ReplicaTermFor(es.dbVersion, "master status")
+	query := fmt.Sprintf("show /* gh-ost readCurrentBinlogCoordinates */ %s", binaryLogStatusTerm)
 	foundMasterStatus := false
-	err := sqlutils.QueryRowsMap(this.db, query, func(m sqlutils.RowMap) error {
-		this.initialBinlogCoordinates = &mysql.BinlogCoordinates{
-			LogFile: m.GetString("File"),
-			LogPos:  m.GetInt64("Position"),
+	err := sqlutils.QueryRowsMap(es.db, query, func(m sqlutils.RowMap) error {
+		if es.migrationContext.UseGTIDs {
+			execGtidSet := m.GetString("Executed_Gtid_Set")
+			coords, err := mysql.NewGTIDBinlogCoordinates(mysql.MySQLFlavor, execGtidSet)
+			if err != nil {
+				return err
+			}
+			es.initialBinlogCoordinates = coords
+		} else {
+			es.initialBinlogCoordinates = &mysql.FileBinlogCoordinates{
+				LogFile: m.GetString("File"),
+				LogPos:  m.GetInt64("Position"),
+			}
 		}
 		foundMasterStatus = true
-
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 	if !foundMasterStatus {
-		return fmt.Errorf("Got no results from SHOW MASTER STATUS. Bailing out")
+		return fmt.Errorf("got no results from SHOW %s. Bailing out", strings.ToUpper(binaryLogStatusTerm))
 	}
-	this.migrationContext.Log.Debugf("Streamer binlog coordinates: %+v", *this.initialBinlogCoordinates)
+	es.migrationContext.Log.Debugf("Streamer binlog coordinates: %+v", es.initialBinlogCoordinates)
+	return nil
+}
+
+// readCurrentMariaDBGTIDCoordinates reads the current binlog GTID position from
+// a MariaDB server, which is exposed via @@global.gtid_binlog_pos rather than a
+// column in SHOW MASTER STATUS.
+func (es *EventsStreamer) readCurrentMariaDBGTIDCoordinates() error {
+	var gtidBinlogPos string
+	if err := es.db.QueryRow(`select @@global.gtid_binlog_pos`).Scan(&gtidBinlogPos); err != nil {
+		return err
+	}
+	coords, err := mysql.NewGTIDBinlogCoordinates(mysql.MariaDBFlavor, gtidBinlogPos)
+	if err != nil {
+		return err
+	}
+	es.initialBinlogCoordinates = coords
+	es.migrationContext.Log.Debugf("Streamer binlog coordinates: %+v", es.initialBinlogCoordinates)
 	return nil
 }
 
 // StreamEvents will begin streaming events. It will be blocking, so should be
 // executed by a goroutine
-func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
+func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 	go func() {
-		for binlogEntry := range this.eventsChannel {
+		for binlogEntry := range es.eventsChannel {
 			if binlogEntry.DmlEvent != nil {
-				this.notifyListeners(binlogEntry.DmlEvent)
+				es.notifyListeners(binlogEntry)
 			}
 		}
 	}()
-	// The next should block and execute forever, unless there's a serious error
-	var successiveFailures int64
-	var lastAppliedRowsEventHint mysql.BinlogCoordinates
+	// The next should block and execute forever, unless there's a serious error.
+	var successiveFailures int
+	var reconnectCoords mysql.BinlogCoordinates
+	ctx := es.migrationContext.GetContext()
 	for {
+		// Check for context cancellation each iteration
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if canStopStreaming() {
 			return nil
 		}
-		if err := this.binlogReader.StreamEvents(canStopStreaming, this.eventsChannel); err != nil {
+		// We will reconnect the binlog streamer at the coordinates
+		// of the last trx that was read completely from the streamer.
+		// Since row event application is idempotent, it's OK if we reapply some events.
+		if err := es.binlogReader.StreamEvents(canStopStreaming, es.eventsChannel); err != nil {
 			if canStopStreaming() {
 				return nil
 			}
 
-			this.migrationContext.Log.Infof("StreamEvents encountered unexpected error: %+v", err)
-			this.migrationContext.MarkPointOfInterest()
+			es.migrationContext.Log.Infof("StreamEvents encountered unexpected error: %+v", err)
+			es.migrationContext.MarkPointOfInterest()
 			time.Sleep(ReconnectStreamerSleepSeconds * time.Second)
 
 			// See if there's retry overflow
-			if this.binlogReader.LastAppliedRowsEventHint.Equals(&lastAppliedRowsEventHint) {
+			if es.migrationContext.BinlogSyncerMaxReconnectAttempts > 0 && successiveFailures >= es.migrationContext.BinlogSyncerMaxReconnectAttempts {
+				return fmt.Errorf("%d successive failures in streamer reconnect at coordinates %+v", successiveFailures, reconnectCoords)
+			}
+
+			// Reposition at same coordinates
+			if es.binlogReader.LastTrxCoords != nil {
+				reconnectCoords = es.binlogReader.LastTrxCoords.Clone()
+			} else {
+				reconnectCoords = es.initialBinlogCoordinates.Clone()
+			}
+			if !reconnectCoords.SmallerThan(es.GetCurrentBinlogCoordinates()) {
 				successiveFailures += 1
 			} else {
 				successiveFailures = 0
 			}
-			if successiveFailures > this.migrationContext.MaxRetries() {
-				return fmt.Errorf("%d successive failures in streamer reconnect at coordinates %+v", successiveFailures, this.GetReconnectBinlogCoordinates())
-			}
 
-			// Reposition at same binlog file.
-			lastAppliedRowsEventHint = this.binlogReader.LastAppliedRowsEventHint
-			this.migrationContext.Log.Infof("Reconnecting... Will resume at %+v", lastAppliedRowsEventHint)
-			if err := this.initBinlogReader(this.GetReconnectBinlogCoordinates()); err != nil {
+			es.migrationContext.Log.Infof("Reconnecting EventsStreamer... Will resume at %+v", reconnectCoords)
+			_ = es.binlogReader.Close()
+			if err := es.initBinlogReader(reconnectCoords); err != nil {
 				return err
 			}
-			this.binlogReader.LastAppliedRowsEventHint = lastAppliedRowsEventHint
 		}
 	}
 }
 
-func (this *EventsStreamer) Close() (err error) {
-	err = this.binlogReader.Close()
-	this.migrationContext.Log.Infof("Closed streamer connection. err=%+v", err)
+func (es *EventsStreamer) Close() (err error) {
+	err = es.binlogReader.Close()
+	es.migrationContext.Log.Infof("Closed streamer connection. err=%+v", err)
 	return err
 }
 
-func (this *EventsStreamer) Teardown() {
-	this.db.Close()
-	return
+func (es *EventsStreamer) Teardown() {
+	es.db.Close()
 }

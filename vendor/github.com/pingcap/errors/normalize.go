@@ -21,8 +21,16 @@ import (
 	"go.uber.org/atomic"
 )
 
+var _ fmt.Formatter = (*redactFormatter)(nil)
+
 // RedactLogEnabled defines whether the arguments of Error need to be redacted.
-var RedactLogEnabled atomic.Bool
+var RedactLogEnabled atomic.String
+
+const (
+	RedactLogEnable  string = "ON"
+	RedactLogDisable        = "OFF"
+	RedactLogMarker         = "MARKER"
+)
 
 // ErrCode represents a specific error type in a error class.
 // Same error code can be used in different error classes.
@@ -34,24 +42,35 @@ type ErrCodeText string
 type ErrorID string
 type RFCErrorCode string
 
+// HackedStr can provide a stable string snapshot for unsafe/ephemeral string sources.
+// The method name intentionally uses FreezeStr instead of Clone so normal clone-style
+// types are not accidentally treated as error-format arguments.
+// During error construction, arguments implementing this interface are replaced
+// with FreezeStr() so deferred error formatting does not observe later mutations.
+type HackedStr interface {
+	FreezeStr() string
+}
+
 // Error is the 'prototype' of a type of errors.
 // Use DefineError to make a *Error:
 // var ErrUnavailable = errors.Normalize("Region %d is unavailable", errors.RFCCodeText("Unavailable"))
 //
 // "throw" it at runtime:
-// func Somewhat() error {
-//     ...
-//     if err != nil {
-//         // generate a stackful error use the message template at defining,
-//         // also see FastGen(it's stackless), GenWithStack(it uses custom message template).
-//         return ErrUnavailable.GenWithStackByArgs(region.ID)
-//     }
-// }
+//
+//	func Somewhat() error {
+//	    ...
+//	    if err != nil {
+//	        // generate a stackful error use the message template at defining,
+//	        // also see FastGen(it's stackless), GenWithStack(it uses custom message template).
+//	        return ErrUnavailable.GenWithStackByArgs(region.ID)
+//	    }
+//	}
 //
 // testing whether an error belongs to a prototype:
-// if ErrUnavailable.Equal(err) {
-//     // handle this error.
-// }
+//
+//	if ErrUnavailable.Equal(err) {
+//	    // handle this error.
+//	}
 type Error struct {
 	code ErrCode
 	// codeText is the textual describe of the error code
@@ -63,6 +82,7 @@ type Error struct {
 	// And it is controlled by the global var RedactLogEnabled.
 	// For example, an original error is `Duplicate entry 'PRIMARY' for key 'key'`,
 	// when RedactLogEnabled is ON and redactArgsPos is [0, 1], the error is `Duplicate entry '?' for key '?'`.
+	// when RedactLogEnabled is MARKER and redactArgsPos is [0, 1], the error is `Duplicate entry '‹..›' for key '‹..›'`.
 	redactArgsPos []int
 	// Cause is used to warp some third party error.
 	cause error
@@ -70,6 +90,8 @@ type Error struct {
 	file  string
 	line  int
 }
+
+var _ messenger = (*Error)(nil)
 
 // Code returns the numeric code of this error.
 // ID() will return textual error if there it is,
@@ -106,14 +128,18 @@ func (e *Error) MessageTemplate() string {
 	return e.message
 }
 
+// Args returns the message arguments of this error.
+func (e *Error) Args() []interface{} {
+	return e.args
+}
+
 // Error implements error interface.
 func (e *Error) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	describe := e.codeText
-	if len(describe) == 0 {
-		describe = ErrCodeText(strconv.Itoa(int(e.code)))
+	if e.cause != nil {
+		return fmt.Sprintf("[%s]%s: %s", e.RFCCode(), e.GetMsg(), e.cause.Error())
 	}
 	return fmt.Sprintf("[%s]%s", e.RFCCode(), e.GetMsg())
 }
@@ -123,6 +149,28 @@ func (e *Error) GetMsg() string {
 		return fmt.Sprintf(e.message, e.args...)
 	}
 	return e.message
+}
+
+func freezeHackedStringArgs(args []interface{}) []interface{} {
+	// This helper intentionally mutates the input slice in place.
+	// It is only used inside error-construction paths where args are internal and should
+	// not be reused by callers after passing into Gen*/FastGen* APIs.
+	for i := range args {
+		hackedArg, ok := args[i].(HackedStr)
+		if !ok {
+			continue
+		}
+		// TiDB may pass unsafe zero-copy strings (for example from chunk buffers) as error args.
+		// Error message rendering is deferred until GetMsg/Error, so without freezing here we may
+		// observe later writes and print a different value than the one used when creating the error.
+		// Freezing in this central path keeps the copy cost only on error construction.
+		args[i] = hackedArg.FreezeStr()
+	}
+	return args
+}
+
+func (e *Error) GetSelfMsg() string {
+	return e.GetMsg()
 }
 
 func (e *Error) fillLineAndFile(skip int) {
@@ -142,7 +190,7 @@ func (e *Error) GenWithStack(format string, args ...interface{}) error {
 	// TODO: RedactErrorArg
 	err := *e
 	err.message = format
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	err.fillLineAndFile(1)
 	return AddStack(&err)
 }
@@ -151,7 +199,7 @@ func (e *Error) GenWithStack(format string, args ...interface{}) error {
 func (e *Error) GenWithStackByArgs(args ...interface{}) error {
 	RedactErrorArg(args, e.redactArgsPos)
 	err := *e
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	err.fillLineAndFile(1)
 	return AddStack(&err)
 }
@@ -162,7 +210,7 @@ func (e *Error) FastGen(format string, args ...interface{}) error {
 	// TODO: RedactErrorArg
 	err := *e
 	err.message = format
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	return SuspendStack(&err)
 }
 
@@ -171,7 +219,7 @@ func (e *Error) FastGen(format string, args ...interface{}) error {
 func (e *Error) FastGenByArgs(args ...interface{}) error {
 	RedactErrorArg(args, e.redactArgsPos)
 	err := *e
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	return SuspendStack(&err)
 }
 
@@ -199,10 +247,17 @@ func (e *Error) NotEqual(err error) bool {
 
 // RedactErrorArg redacts the args by position if RedactLogEnabled is enabled.
 func RedactErrorArg(args []interface{}, position []int) {
-	if RedactLogEnabled.Load() {
+	switch RedactLogEnabled.Load() {
+	case RedactLogEnable:
 		for _, pos := range position {
 			if len(args) > pos {
 				args[pos] = "?"
+			}
+		}
+	case RedactLogMarker:
+		for _, pos := range position {
+			if len(args) > pos {
+				args[pos] = &redactFormatter{args[pos]}
 			}
 		}
 	}
@@ -252,6 +307,26 @@ func (e *Error) Wrap(err error) *Error {
 	return nil
 }
 
+// Unwrap returns cause of the error.
+// It allows Error to work with errors.Is() and errors.As() from the Go
+// standard package.
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// Is checks if e has the same error ID with other.
+// It allows Error to work with errors.Is() from the Go standard package.
+func (e *Error) Is(other error) bool {
+	err, ok := other.(*Error)
+	if !ok {
+		return false
+	}
+	return (e == nil && err == nil) || (e != nil && err != nil && e.ID() == err.ID())
+}
+
 func (e *Error) Cause() error {
 	root := Unwrap(e.cause)
 	if root == nil {
@@ -265,7 +340,7 @@ func (e *Error) FastGenWithCause(args ...interface{}) error {
 	if e.cause != nil {
 		err.message = e.cause.Error()
 	}
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	return SuspendStack(&err)
 }
 
@@ -274,7 +349,7 @@ func (e *Error) GenWithStackByCause(args ...interface{}) error {
 	if e.cause != nil {
 		err.message = e.cause.Error()
 	}
-	err.args = args
+	err.args = freezeHackedStringArgs(args)
 	err.fillLineAndFile(1)
 	return AddStack(&err)
 }
@@ -310,4 +385,22 @@ func Normalize(message string, opts ...NormalizeOption) *Error {
 		opt(e)
 	}
 	return e
+}
+
+type redactFormatter struct {
+	arg interface{}
+}
+
+func (e *redactFormatter) Format(f fmt.State, verb rune) {
+	origin := fmt.Sprintf(fmt.FormatString(f, verb), e.arg)
+	fmt.Fprintf(f, "‹")
+	for _, c := range origin {
+		if c == '‹' || c == '›' {
+			fmt.Fprintf(f, "%c", c)
+			fmt.Fprintf(f, "%c", c)
+		} else {
+			fmt.Fprintf(f, "%c", c)
+		}
+	}
+	fmt.Fprintf(f, "›")
 }

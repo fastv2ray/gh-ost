@@ -23,7 +23,8 @@ func NewLoadMap() LoadMap {
 
 // NewLoadMap parses a `--*-load` flag (e.g. `--max-load`), which is in multiple
 // key-value format, such as:
-//   'Threads_running=100,Threads_connected=500'
+//
+//	'Threads_running=100,Threads_connected=500'
 func ParseLoadMap(loadList string) (LoadMap, error) {
 	result := NewLoadMap()
 	if loadList == "" {
@@ -50,18 +51,18 @@ func ParseLoadMap(loadList string) (LoadMap, error) {
 }
 
 // Duplicate creates a clone of this map
-func (this *LoadMap) Duplicate() LoadMap {
+func (lm *LoadMap) Duplicate() LoadMap {
 	dup := make(map[string]int64)
-	for k, v := range *this {
+	for k, v := range *lm {
 		dup[k] = v
 	}
 	return dup
 }
 
 // String() returns a string representation of this map
-func (this *LoadMap) String() string {
+func (lm *LoadMap) String() string {
 	tokens := []string{}
-	for key, val := range *this {
+	for key, val := range *lm {
 		token := fmt.Sprintf("%s=%d", key, val)
 		tokens = append(tokens, token)
 	}

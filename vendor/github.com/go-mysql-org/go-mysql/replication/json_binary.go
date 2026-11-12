@@ -1,15 +1,17 @@
 package replication
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 
-	. "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/utils"
+	"github.com/goccy/go-json"
 	"github.com/pingcap/errors"
-	"github.com/siddontang/go/hack"
 )
 
+//nolint:revive // JSONB type tags mirror the upstream MySQL JSON binary format
 const (
 	JSONB_SMALL_OBJECT byte = iota // small JSON object
 	JSONB_LARGE_OBJECT             // large JSON object
@@ -27,6 +29,7 @@ const (
 	JSONB_OPAQUE       byte = 0x0f // custom data (any MySQL data type)
 )
 
+//nolint:revive // JSONB literal tags mirror the upstream MySQL JSON binary format
 const (
 	JSONB_NULL_LITERAL  byte = 0x00
 	JSONB_TRUE_LITERAL  byte = 0x01
@@ -43,6 +46,71 @@ const (
 	jsonbValueEntrySizeSmall = 1 + jsonbSmallOffsetSize
 	jsonbValueEntrySizeLarge = 1 + jsonbLargeOffsetSize
 )
+
+var ErrCorruptedJSONDiff = fmt.Errorf("corrupted JSON diff") // ER_CORRUPTED_JSON_DIFF
+
+//nolint:revive // exported type renamed would be a breaking API change
+type (
+	// JsonDiffOperation is an enum that describes what kind of operation a JsonDiff object represents.
+	// https://github.com/mysql/mysql-server/blob/8.0/sql/json_diff.h
+	JsonDiffOperation byte
+)
+
+type FloatWithTrailingZero float64
+
+//nolint:revive // exported constants renamed would be a breaking API change
+const (
+	// The JSON value in the given path is replaced with a new value.
+	//
+	// It has the same effect as `JSON_REPLACE(col, path, value)`.
+	JsonDiffOperationReplace = JsonDiffOperation(iota)
+
+	// Add a new element at the given path.
+	//
+	//  If the path specifies an array element, it has the same effect as `JSON_ARRAY_INSERT(col, path, value)`.
+	//
+	//  If the path specifies an object member, it has the same effect as `JSON_INSERT(col, path, value)`.
+	JsonDiffOperationInsert
+
+	// The JSON value at the given path is removed from an array or object.
+	//
+	// It has the same effect as `JSON_REMOVE(col, path)`.
+	JsonDiffOperationRemove
+)
+
+//nolint:revive // exported type renamed would be a breaking API change
+type (
+	JsonDiff struct {
+		Op    JsonDiffOperation
+		Path  string
+		Value string
+	}
+)
+
+func (op JsonDiffOperation) String() string {
+	switch op {
+	case JsonDiffOperationReplace:
+		return "Replace"
+	case JsonDiffOperationInsert:
+		return "Insert"
+	case JsonDiffOperationRemove:
+		return "Remove"
+	default:
+		return fmt.Sprintf("Unknown(%d)", op)
+	}
+}
+
+func (jd *JsonDiff) String() string {
+	return fmt.Sprintf("json_diff(op:%s path:%s value:%s)", jd.Op, jd.Path, jd.Value)
+}
+
+func (f FloatWithTrailingZero) MarshalJSON() ([]byte, error) {
+	if float64(f) == float64(int(f)) {
+		return []byte(strconv.FormatFloat(float64(f), 'f', 1, 64)), nil
+	}
+
+	return []byte(strconv.FormatFloat(float64(f), 'f', -1, 64)), nil
+}
 
 func jsonbGetOffsetSize(isSmall bool) int {
 	if isSmall {
@@ -68,17 +136,13 @@ func jsonbGetValueEntrySize(isSmall bool) int {
 	return jsonbValueEntrySizeLarge
 }
 
-// decodeJsonBinary decodes the JSON binary encoding data and returns
+// decodeJSONBinary decodes the JSON binary encoding data and returns
 // the common JSON encoding data.
-func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
-	// Sometimes, we can insert a NULL JSON even we set the JSON field as NOT NULL.
-	// If we meet this case, we can return an empty slice.
-	if len(data) == 0 {
-		return []byte{}, nil
-	}
+func (e *RowsEvent) decodeJSONBinary(data []byte) ([]byte, error) {
 	d := jsonBinaryDecoder{
-		useDecimal:      e.useDecimal,
-		ignoreDecodeErr: e.ignoreJSONDecodeErr,
+		useDecimal:               e.useDecimal,
+		useFloatWithTrailingZero: e.useFloatWithTrailingZero,
+		ignoreDecodeErr:          e.ignoreJSONDecodeErr,
 	}
 
 	if d.isDataShort(data, 1) {
@@ -94,12 +158,13 @@ func (e *RowsEvent) decodeJsonBinary(data []byte) ([]byte, error) {
 }
 
 type jsonBinaryDecoder struct {
-	useDecimal      bool
-	ignoreDecodeErr bool
-	err             error
+	useDecimal               bool
+	useFloatWithTrailingZero bool
+	ignoreDecodeErr          bool
+	err                      error
 }
 
-func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) any {
 	if d.err != nil {
 		return nil
 	}
@@ -128,6 +193,9 @@ func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
 	case JSONB_UINT64:
 		return d.decodeUint64(data)
 	case JSONB_DOUBLE:
+		if d.useFloatWithTrailingZero {
+			return d.decodeDoubleWithTrailingZero(data)
+		}
 		return d.decodeDouble(data)
 	case JSONB_STRING:
 		return d.decodeString(data)
@@ -140,7 +208,7 @@ func (d *jsonBinaryDecoder) decodeValue(tp byte, data []byte) interface{} {
 	return nil
 }
 
-func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObject bool) interface{} {
+func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObject bool) any {
 	offsetSize := jsonbGetOffsetSize(isSmall)
 	if d.isDataShort(data, 2*offsetSize) {
 		return nil
@@ -177,7 +245,7 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 	var keys []string
 	if isObject {
 		keys = make([]string, count)
-		for i := 0; i < count; i++ {
+		for i := range count {
 			// decode key
 			entryOffset := 2*offsetSize + keyEntrySize*i
 			keyOffset := d.decodeCount(data[entryOffset:], isSmall)
@@ -193,7 +261,7 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 				return nil
 			}
 
-			keys[i] = hack.String(data[keyOffset : keyOffset+keyLength])
+			keys[i] = utils.ByteSliceToString(data[keyOffset : keyOffset+keyLength])
 		}
 	}
 
@@ -201,8 +269,8 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 		return nil
 	}
 
-	values := make([]interface{}, count)
-	for i := 0; i < count; i++ {
+	values := make([]any, count)
+	for i := range count {
 		// decode value
 		entryOffset := 2*offsetSize + valueEntrySize*i
 		if isObject {
@@ -233,8 +301,8 @@ func (d *jsonBinaryDecoder) decodeObjectOrArray(data []byte, isSmall bool, isObj
 		return values
 	}
 
-	m := make(map[string]interface{}, count)
-	for i := 0; i < count; i++ {
+	m := make(map[string]any, count)
+	for i := range count {
 		m[keys[i]] = values[i]
 	}
 
@@ -252,7 +320,7 @@ func isInlineValue(tp byte, isSmall bool) bool {
 	return false
 }
 
-func (d *jsonBinaryDecoder) decodeLiteral(data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeLiteral(data []byte) any {
 	if d.isDataShort(data, 1) {
 		return nil
 	}
@@ -290,7 +358,7 @@ func (d *jsonBinaryDecoder) decodeInt16(data []byte) int16 {
 		return 0
 	}
 
-	v := ParseBinaryInt16(data[0:2])
+	v := mysql.ParseBinaryInt16(data[0:2])
 	return v
 }
 
@@ -299,7 +367,7 @@ func (d *jsonBinaryDecoder) decodeUint16(data []byte) uint16 {
 		return 0
 	}
 
-	v := ParseBinaryUint16(data[0:2])
+	v := mysql.ParseBinaryUint16(data[0:2])
 	return v
 }
 
@@ -308,7 +376,7 @@ func (d *jsonBinaryDecoder) decodeInt32(data []byte) int32 {
 		return 0
 	}
 
-	v := ParseBinaryInt32(data[0:4])
+	v := mysql.ParseBinaryInt32(data[0:4])
 	return v
 }
 
@@ -317,7 +385,7 @@ func (d *jsonBinaryDecoder) decodeUint32(data []byte) uint32 {
 		return 0
 	}
 
-	v := ParseBinaryUint32(data[0:4])
+	v := mysql.ParseBinaryUint32(data[0:4])
 	return v
 }
 
@@ -326,7 +394,7 @@ func (d *jsonBinaryDecoder) decodeInt64(data []byte) int64 {
 		return 0
 	}
 
-	v := ParseBinaryInt64(data[0:8])
+	v := mysql.ParseBinaryInt64(data[0:8])
 	return v
 }
 
@@ -335,7 +403,7 @@ func (d *jsonBinaryDecoder) decodeUint64(data []byte) uint64 {
 		return 0
 	}
 
-	v := ParseBinaryUint64(data[0:8])
+	v := mysql.ParseBinaryUint64(data[0:8])
 	return v
 }
 
@@ -344,8 +412,13 @@ func (d *jsonBinaryDecoder) decodeDouble(data []byte) float64 {
 		return 0
 	}
 
-	v := ParseBinaryFloat64(data[0:8])
+	v := mysql.ParseBinaryFloat64(data[0:8])
 	return v
+}
+
+func (d *jsonBinaryDecoder) decodeDoubleWithTrailingZero(data []byte) FloatWithTrailingZero {
+	v := d.decodeDouble(data)
+	return FloatWithTrailingZero(v)
 }
 
 func (d *jsonBinaryDecoder) decodeString(data []byte) string {
@@ -361,11 +434,11 @@ func (d *jsonBinaryDecoder) decodeString(data []byte) string {
 
 	data = data[n:]
 
-	v := hack.String(data[0:l])
+	v := utils.ByteSliceToString(data[0:l])
 	return v
 }
 
-func (d *jsonBinaryDecoder) decodeOpaque(data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeOpaque(data []byte) any {
 	if d.isDataShort(data, 1) {
 		return nil
 	}
@@ -382,20 +455,18 @@ func (d *jsonBinaryDecoder) decodeOpaque(data []byte) interface{} {
 	data = data[n : l+n]
 
 	switch tp {
-	case MYSQL_TYPE_NEWDECIMAL:
+	case mysql.MYSQL_TYPE_NEWDECIMAL:
 		return d.decodeDecimal(data)
-	case MYSQL_TYPE_TIME:
+	case mysql.MYSQL_TYPE_TIME:
 		return d.decodeTime(data)
-	case MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIMESTAMP:
+	case mysql.MYSQL_TYPE_DATE, mysql.MYSQL_TYPE_DATETIME, mysql.MYSQL_TYPE_TIMESTAMP:
 		return d.decodeDateTime(data)
 	default:
-		return hack.String(data)
+		return utils.ByteSliceToString(data)
 	}
-
-	return nil
 }
 
-func (d *jsonBinaryDecoder) decodeDecimal(data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeDecimal(data []byte) any {
 	precision := int(data[0])
 	scale := int(data[1])
 
@@ -405,7 +476,7 @@ func (d *jsonBinaryDecoder) decodeDecimal(data []byte) interface{} {
 	return v
 }
 
-func (d *jsonBinaryDecoder) decodeTime(data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeTime(data []byte) any {
 	v := d.decodeInt64(data)
 
 	if v == 0 {
@@ -420,14 +491,14 @@ func (d *jsonBinaryDecoder) decodeTime(data []byte) interface{} {
 
 	intPart := v >> 24
 	hour := (intPart >> 12) % (1 << 10)
-	min := (intPart >> 6) % (1 << 6)
+	minute := (intPart >> 6) % (1 << 6)
 	sec := intPart % (1 << 6)
 	frac := v % (1 << 24)
 
-	return fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hour, min, sec, frac)
+	return fmt.Sprintf("%s%02d:%02d:%02d.%06d", sign, hour, minute, sec, frac)
 }
 
-func (d *jsonBinaryDecoder) decodeDateTime(data []byte) interface{} {
+func (d *jsonBinaryDecoder) decodeDateTime(data []byte) any {
 	v := d.decodeInt64(data)
 	if v == 0 {
 		return "0000-00-00 00:00:00"
@@ -446,7 +517,7 @@ func (d *jsonBinaryDecoder) decodeDateTime(data []byte) interface{} {
 	year := ym / 13
 	month := ym % 13
 	day := ymd % (1 << 5)
-	hour := (hms >> 12)
+	hour := hms >> 12
 	minute := (hms >> 6) % (1 << 6)
 	second := hms % (1 << 6)
 	frac := v % (1 << 24)
@@ -466,10 +537,7 @@ func (d *jsonBinaryDecoder) decodeCount(data []byte, isSmall bool) int {
 func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
 	// The max size for variable length is math.MaxUint32, so
 	// here we can use 5 bytes to save it.
-	maxCount := 5
-	if len(data) < maxCount {
-		maxCount = len(data)
-	}
+	maxCount := min(len(data), 5)
 
 	pos := 0
 	length := uint64(0)
@@ -483,7 +551,7 @@ func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
 				return 0, 0
 			}
 
-			pos += 1
+			pos++
 			// TODO: should consider length overflow int here.
 			return int(length), pos
 		}
@@ -492,4 +560,44 @@ func (d *jsonBinaryDecoder) decodeVariableLength(data []byte) (int, int) {
 	d.err = errors.New("decode variable length failed")
 
 	return 0, 0
+}
+
+func (e *RowsEvent) decodeJSONPartialBinary(data []byte) (*JsonDiff, error) {
+	// see Json_diff_vector::read_binary() in mysql-server/sql/json_diff.cc
+	operationNumber := JsonDiffOperation(data[0])
+	switch operationNumber {
+	case JsonDiffOperationReplace:
+	case JsonDiffOperationInsert:
+	case JsonDiffOperationRemove:
+	default:
+		return nil, ErrCorruptedJSONDiff
+	}
+	data = data[1:]
+
+	pathLength, _, n := mysql.LengthEncodedInt(data)
+	data = data[n:]
+
+	path := data[:pathLength]
+	data = data[pathLength:]
+
+	diff := &JsonDiff{
+		Op:   operationNumber,
+		Path: string(path),
+		// Value will be filled below
+	}
+
+	if operationNumber == JsonDiffOperationRemove {
+		return diff, nil
+	}
+
+	valueLength, _, n := mysql.LengthEncodedInt(data)
+	data = data[n:]
+
+	d, err := e.decodeJSONBinary(data[:valueLength])
+	if err != nil {
+		return nil, fmt.Errorf("cannot read json diff for field %q: %w", path, err)
+	}
+	diff.Value = string(d)
+
+	return diff, nil
 }

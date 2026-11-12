@@ -1,6 +1,5 @@
 /*
-/*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,9 +7,11 @@ package logic
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	"github.com/github/gh-ost/go/base"
@@ -28,139 +29,365 @@ const (
 	onInteractiveCommand = "gh-ost-on-interactive-command"
 	onSuccess            = "gh-ost-on-success"
 	onFailure            = "gh-ost-on-failure"
+	onBatchCopyRetry     = "gh-ost-on-batch-copy-retry"
 	onStatus             = "gh-ost-on-status"
 	onStopReplication    = "gh-ost-on-stop-replication"
 	onStartReplication   = "gh-ost-on-start-replication"
 )
 
-type HooksExecutor struct {
-	migrationContext *base.MigrationContext
-}
+// CompositeHooks invokes each member in order, returning the first non-nil error.
+type CompositeHooks []base.Hooks
 
-func NewHooksExecutor(migrationContext *base.MigrationContext) *HooksExecutor {
-	return &HooksExecutor{
-		migrationContext: migrationContext,
-	}
-}
-
-func (this *HooksExecutor) initHooks() error {
-	return nil
-}
-
-func (this *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) []string {
-	env := os.Environ()
-	env = append(env, fmt.Sprintf("GH_OST_DATABASE_NAME=%s", this.migrationContext.DatabaseName))
-	env = append(env, fmt.Sprintf("GH_OST_TABLE_NAME=%s", this.migrationContext.OriginalTableName))
-	env = append(env, fmt.Sprintf("GH_OST_GHOST_TABLE_NAME=%s", this.migrationContext.GetGhostTableName()))
-	env = append(env, fmt.Sprintf("GH_OST_OLD_TABLE_NAME=%s", this.migrationContext.GetOldTableName()))
-	env = append(env, fmt.Sprintf("GH_OST_DDL=%s", this.migrationContext.AlterStatement))
-	env = append(env, fmt.Sprintf("GH_OST_ELAPSED_SECONDS=%f", this.migrationContext.ElapsedTime().Seconds()))
-	env = append(env, fmt.Sprintf("GH_OST_ELAPSED_COPY_SECONDS=%f", this.migrationContext.ElapsedRowCopyTime().Seconds()))
-	estimatedRows := atomic.LoadInt64(&this.migrationContext.RowsEstimate) + atomic.LoadInt64(&this.migrationContext.RowsDeltaEstimate)
-	env = append(env, fmt.Sprintf("GH_OST_ESTIMATED_ROWS=%d", estimatedRows))
-	totalRowsCopied := this.migrationContext.GetTotalRowsCopied()
-	env = append(env, fmt.Sprintf("GH_OST_COPIED_ROWS=%d", totalRowsCopied))
-	env = append(env, fmt.Sprintf("GH_OST_MIGRATED_HOST=%s", this.migrationContext.GetApplierHostname()))
-	env = append(env, fmt.Sprintf("GH_OST_INSPECTED_HOST=%s", this.migrationContext.GetInspectorHostname()))
-	env = append(env, fmt.Sprintf("GH_OST_EXECUTING_HOST=%s", this.migrationContext.Hostname))
-	env = append(env, fmt.Sprintf("GH_OST_INSPECTED_LAG=%f", this.migrationContext.GetCurrentLagDuration().Seconds()))
-	env = append(env, fmt.Sprintf("GH_OST_HEARTBEAT_LAG=%f", this.migrationContext.TimeSinceLastHeartbeatOnChangelog().Seconds()))
-	env = append(env, fmt.Sprintf("GH_OST_PROGRESS=%f", this.migrationContext.GetProgressPct()))
-	env = append(env, fmt.Sprintf("GH_OST_ETA_SECONDS=%d", this.migrationContext.GetETASeconds()))
-	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT=%s", this.migrationContext.HooksHintMessage))
-	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_OWNER=%s", this.migrationContext.HooksHintOwner))
-	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_TOKEN=%s", this.migrationContext.HooksHintToken))
-	env = append(env, fmt.Sprintf("GH_OST_DRY_RUN=%t", this.migrationContext.Noop))
-
-	for _, variable := range extraVariables {
-		env = append(env, variable)
-	}
-	return env
-}
-
-// executeHook executes a command, and sets relevant environment variables
-// combined output & error are printed to gh-ost's standard error.
-func (this *HooksExecutor) executeHook(hook string, extraVariables ...string) error {
-	cmd := exec.Command(hook)
-	cmd.Env = this.applyEnvironmentVariables(extraVariables...)
-
-	combinedOutput, err := cmd.CombinedOutput()
-	fmt.Fprintln(os.Stderr, string(combinedOutput))
-	return log.Errore(err)
-}
-
-func (this *HooksExecutor) detectHooks(baseName string) (hooks []string, err error) {
-	if this.migrationContext.HooksPath == "" {
-		return hooks, err
-	}
-	pattern := fmt.Sprintf("%s/%s*", this.migrationContext.HooksPath, baseName)
-	hooks, err = filepath.Glob(pattern)
-	return hooks, err
-}
-
-func (this *HooksExecutor) executeHooks(baseName string, extraVariables ...string) error {
-	hooks, err := this.detectHooks(baseName)
-	if err != nil {
-		return err
-	}
-	for _, hook := range hooks {
-		log.Infof("executing %+v hook: %+v", baseName, hook)
-		if err := this.executeHook(hook, extraVariables...); err != nil {
+func (c CompositeHooks) OnStartup() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnStartup(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (this *HooksExecutor) onStartup() error {
-	return this.executeHooks(onStartup)
+func (c CompositeHooks) OnValidated() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnValidated(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (this *HooksExecutor) onValidated() error {
-	return this.executeHooks(onValidated)
+func (c CompositeHooks) OnRowCountComplete() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnRowCountComplete(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (this *HooksExecutor) onRowCountComplete() error {
-	return this.executeHooks(onRowCountComplete)
-}
-func (this *HooksExecutor) onBeforeRowCopy() error {
-	return this.executeHooks(onBeforeRowCopy)
-}
-
-func (this *HooksExecutor) onRowCopyComplete() error {
-	return this.executeHooks(onRowCopyComplete)
-}
-
-func (this *HooksExecutor) onBeginPostponed() error {
-	return this.executeHooks(onBeginPostponed)
+func (c CompositeHooks) OnBeforeRowCopy() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnBeforeRowCopy(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (this *HooksExecutor) onBeforeCutOver() error {
-	return this.executeHooks(onBeforeCutOver)
+func (c CompositeHooks) OnRowCopyComplete() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnRowCopyComplete(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (this *HooksExecutor) onInteractiveCommand(command string) error {
+func (c CompositeHooks) OnBeginPostponed() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnBeginPostponed(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnBeforeCutOver() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnBeforeCutOver(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnInteractiveCommand(command string) error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnInteractiveCommand(command); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnSuccess(instantDDL bool) error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnSuccess(instantDDL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnFailure() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnFailure(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnBatchCopyRetry(errorMessage string) error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnBatchCopyRetry(errorMessage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnStatus(statusMessage string) error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnStatus(statusMessage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnStopReplication() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnStopReplication(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c CompositeHooks) OnStartReplication() error {
+	for _, h := range c {
+		if h == nil {
+			continue
+		}
+		if err := h.OnStartReplication(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type HooksExecutor struct {
+	migrationContext *base.MigrationContext
+	writer           io.Writer
+}
+
+func NewHooksExecutor(migrationContext *base.MigrationContext) *HooksExecutor {
+	return &HooksExecutor{
+		migrationContext: migrationContext,
+		writer:           os.Stderr,
+	}
+}
+
+func (he *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) []string {
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("GH_OST_DATABASE_NAME=%s", he.migrationContext.DatabaseName))
+
+	var tableNameEnv string
+	if he.migrationContext.IsMoveTablesMode() {
+		tableNameEnv = strings.Join(he.migrationContext.MoveTables.TableNames, ",")
+	} else {
+		tableNameEnv = he.migrationContext.OriginalTableName
+	}
+	env = append(env, fmt.Sprintf("GH_OST_TABLE_NAME=%s", tableNameEnv))
+	var ghostTableNameEnv string
+	var oldTableNameEnv string
+	if he.migrationContext.IsMoveTablesMode() {
+		// No ghost or old tables in move-tables mode: the destination keeps each
+		// source table's name, and the rollback handles are the per-table
+		// `_<table>_del` tables produced by the atomic cutover RENAME.
+		ghostTableNameEnv = strings.Join(he.migrationContext.MoveTables.TableNames, ",")
+		delNames := make([]string, 0, len(he.migrationContext.MoveTables.TableNames))
+		for _, tableName := range he.migrationContext.MoveTables.TableNames {
+			delNames = append(delNames, he.migrationContext.MoveTableDelName(tableName))
+		}
+		oldTableNameEnv = strings.Join(delNames, ",")
+	} else {
+		ghostTableNameEnv = he.migrationContext.GetGhostTableName()
+		oldTableNameEnv = he.migrationContext.GetOldTableName()
+	}
+	env = append(env, fmt.Sprintf("GH_OST_GHOST_TABLE_NAME=%s", ghostTableNameEnv))
+	env = append(env, fmt.Sprintf("GH_OST_OLD_TABLE_NAME=%s", oldTableNameEnv))
+	env = append(env, fmt.Sprintf("GH_OST_DDL=%s", he.migrationContext.AlterStatement))
+	env = append(env, fmt.Sprintf("GH_OST_ELAPSED_SECONDS=%f", he.migrationContext.ElapsedTime().Seconds()))
+	env = append(env, fmt.Sprintf("GH_OST_ELAPSED_COPY_SECONDS=%f", he.migrationContext.ElapsedRowCopyTime().Seconds()))
+	estimatedRows := atomic.LoadInt64(&he.migrationContext.RowsEstimate) + atomic.LoadInt64(&he.migrationContext.RowsDeltaEstimate)
+	env = append(env, fmt.Sprintf("GH_OST_ESTIMATED_ROWS=%d", estimatedRows))
+	totalRowsCopied := he.migrationContext.GetTotalRowsCopied()
+	env = append(env, fmt.Sprintf("GH_OST_COPIED_ROWS=%d", totalRowsCopied))
+	env = append(env, fmt.Sprintf("GH_OST_MIGRATED_HOST=%s", he.migrationContext.GetApplierHostname()))
+	env = append(env, fmt.Sprintf("GH_OST_INSPECTED_HOST=%s", he.migrationContext.GetInspectorHostname()))
+	env = append(env, fmt.Sprintf("GH_OST_EXECUTING_HOST=%s", he.migrationContext.Hostname))
+	env = append(env, fmt.Sprintf("GH_OST_TARGET_HOST=%s", he.migrationContext.GetTargetHostname()))
+	env = append(env, fmt.Sprintf("GH_OST_INSPECTED_LAG=%f", he.migrationContext.GetCurrentLagDuration().Seconds()))
+	// In move-tables mode there is no changelog heartbeat; writer lag (now - last
+	// applied binlog event timestamp) replaces the heartbeat-derived lag. Re-point
+	// GH_OST_HEARTBEAT_LAG at it so existing hooks keep seeing a meaningful value,
+	// and also expose it explicitly as GH_OST_BINLOG_WRITER_LAG_SECONDS.
+	heartbeatLagSeconds := he.migrationContext.TimeSinceLastHeartbeatOnChangelog().Seconds()
+	binlogWriterLagSeconds := he.migrationContext.GetBinlogWriterLag().Seconds()
+	if he.migrationContext.IsMoveTablesMode() {
+		heartbeatLagSeconds = binlogWriterLagSeconds
+	}
+	env = append(env, fmt.Sprintf("GH_OST_HEARTBEAT_LAG=%f", heartbeatLagSeconds))
+	env = append(env, fmt.Sprintf("GH_OST_BINLOG_WRITER_LAG_SECONDS=%f", binlogWriterLagSeconds))
+	env = append(env, fmt.Sprintf("GH_OST_PROGRESS=%f", he.migrationContext.GetProgressPct()))
+	env = append(env, fmt.Sprintf("GH_OST_ETA_SECONDS=%d", he.migrationContext.GetETASeconds()))
+	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT=%s", he.migrationContext.HooksHintMessage))
+	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_OWNER=%s", he.migrationContext.HooksHintOwner))
+	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_TOKEN=%s", he.migrationContext.HooksHintToken))
+	env = append(env, fmt.Sprintf("GH_OST_DRY_RUN=%t", he.migrationContext.Noop))
+	env = append(env, fmt.Sprintf("GH_OST_REVERT=%t", he.migrationContext.Revert))
+	env = append(env, fmt.Sprintf("GH_OST_MOVE_TABLES=%t", he.migrationContext.IsMoveTablesMode()))
+	if he.migrationContext.IsMoveTablesMode() {
+		// Comma-joined list of all migrated tables.
+		env = append(env, fmt.Sprintf("GH_OST_TABLES=%s", strings.Join(he.migrationContext.MoveTables.TableNames, ",")))
+	}
+	env = append(env, fmt.Sprintf("GH_OST_TARGET_DATABASE_NAME=%s", he.migrationContext.GetTargetDatabaseName()))
+
+	var targetTableNameEnv string
+	if he.migrationContext.IsMoveTablesMode() {
+		targetTableNameEnv = strings.Join(he.migrationContext.MoveTables.TableNames, ",")
+	} else {
+		targetTableNameEnv = he.migrationContext.GetGhostTableName()
+	}
+	env = append(env, fmt.Sprintf("GH_OST_TARGET_TABLE_NAME=%s", targetTableNameEnv))
+	env = append(env, extraVariables...)
+	return env
+}
+
+// executeHook executes a command, and sets relevant environment variables
+// combined output & error are printed to the configured writer.
+func (he *HooksExecutor) executeHook(hook string, extraVariables ...string) error {
+	he.migrationContext.Log.Infof("executing hook: %+v", hook)
+	cmd := exec.Command(hook)
+	cmd.Env = he.applyEnvironmentVariables(extraVariables...)
+
+	combinedOutput, err := cmd.CombinedOutput()
+	fmt.Fprintln(he.writer, string(combinedOutput))
+	return log.Errore(err)
+}
+
+func (he *HooksExecutor) detectHooks(baseName string) (hooks []string, err error) {
+	if he.migrationContext.HooksPath == "" {
+		return hooks, err
+	}
+	pattern := fmt.Sprintf("%s/%s*", he.migrationContext.HooksPath, baseName)
+	hooks, err = filepath.Glob(pattern)
+	return hooks, err
+}
+
+func (he *HooksExecutor) executeHooks(baseName string, extraVariables ...string) error {
+	hooks, err := he.detectHooks(baseName)
+	if err != nil {
+		return err
+	}
+	for _, hook := range hooks {
+		log.Infof("executing %+v hook: %+v", baseName, hook)
+		if err := he.executeHook(hook, extraVariables...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (he *HooksExecutor) OnStartup() error {
+	return he.executeHooks(onStartup)
+}
+
+func (he *HooksExecutor) OnValidated() error {
+	return he.executeHooks(onValidated)
+}
+
+func (he *HooksExecutor) OnRowCountComplete() error {
+	return he.executeHooks(onRowCountComplete)
+}
+func (he *HooksExecutor) OnBeforeRowCopy() error {
+	return he.executeHooks(onBeforeRowCopy)
+}
+
+func (he *HooksExecutor) OnBatchCopyRetry(errorMessage string) error {
+	v := fmt.Sprintf("GH_OST_LAST_BATCH_COPY_ERROR=%s", errorMessage)
+	return he.executeHooks(onBatchCopyRetry, v)
+}
+
+func (he *HooksExecutor) OnRowCopyComplete() error {
+	return he.executeHooks(onRowCopyComplete)
+}
+
+func (he *HooksExecutor) OnBeginPostponed() error {
+	return he.executeHooks(onBeginPostponed)
+}
+
+func (he *HooksExecutor) OnBeforeCutOver() error {
+	return he.executeHooks(onBeforeCutOver)
+}
+
+func (he *HooksExecutor) OnInteractiveCommand(command string) error {
 	v := fmt.Sprintf("GH_OST_COMMAND='%s'", command)
-	return this.executeHooks(onInteractiveCommand, v)
+	return he.executeHooks(onInteractiveCommand, v)
 }
 
-func (this *HooksExecutor) onSuccess() error {
-	return this.executeHooks(onSuccess)
+func (he *HooksExecutor) OnSuccess(instantDDL bool) error {
+	v := []string{fmt.Sprintf("GH_OST_INSTANT_DDL=%t", instantDDL)}
+	if he.migrationContext.IsMoveTablesMode() && he.migrationContext.MoveTables.DrainGTID != nil {
+		v = append(v, fmt.Sprintf("GH_OST_DRAIN_GTID=%s", he.migrationContext.MoveTables.DrainGTID.String()))
+	}
+	return he.executeHooks(onSuccess, v...)
 }
 
-func (this *HooksExecutor) onFailure() error {
-	return this.executeHooks(onFailure)
+func (he *HooksExecutor) OnFailure() error {
+	return he.executeHooks(onFailure)
 }
 
-func (this *HooksExecutor) onStatus(statusMessage string) error {
+func (he *HooksExecutor) OnStatus(statusMessage string) error {
 	v := fmt.Sprintf("GH_OST_STATUS='%s'", statusMessage)
-	return this.executeHooks(onStatus, v)
+	return he.executeHooks(onStatus, v)
 }
 
-func (this *HooksExecutor) onStopReplication() error {
-	return this.executeHooks(onStopReplication)
+func (he *HooksExecutor) OnStopReplication() error {
+	return he.executeHooks(onStopReplication)
 }
 
-func (this *HooksExecutor) onStartReplication() error {
-	return this.executeHooks(onStartReplication)
+func (he *HooksExecutor) OnStartReplication() error {
+	return he.executeHooks(onStartReplication)
 }

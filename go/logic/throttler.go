@@ -1,11 +1,12 @@
 /*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
 package logic
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/github/gh-ost/go/base"
+	"github.com/github/gh-ost/go/metrics"
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
 )
@@ -37,29 +39,42 @@ var (
 	}
 )
 
-const frenoMagicHint = "freno"
+const (
+	frenoMagicHint               = "freno"
+	throttleActiveMetricInterval = time.Second
+)
 
 // Throttler collects metrics related to throttling and makes informed decision
 // whether throttling should take place.
 type Throttler struct {
+	appVersion        string
 	migrationContext  *base.MigrationContext
 	applier           *Applier
+	httpClient        *http.Client
+	httpClientTimeout time.Duration
 	inspector         *Inspector
 	finishedMigrating int64
+
+	throttleStartedAt     time.Time
+	throttleStartedReason string
+	throttleActiveEmitted time.Time
 }
 
-func NewThrottler(migrationContext *base.MigrationContext, applier *Applier, inspector *Inspector) *Throttler {
+func NewThrottler(migrationContext *base.MigrationContext, applier *Applier, inspector *Inspector, appVersion string) *Throttler {
 	return &Throttler{
+		appVersion:        appVersion,
 		migrationContext:  migrationContext,
 		applier:           applier,
+		httpClient:        &http.Client{},
+		httpClientTimeout: time.Duration(migrationContext.ThrottleHTTPTimeoutMillis) * time.Millisecond,
 		inspector:         inspector,
 		finishedMigrating: 0,
 	}
 }
 
-func (this *Throttler) throttleHttpMessage(statusCode int) string {
+func (thlr *Throttler) throttleHttpMessage(statusCode int) string {
 	statusCodesMap := httpStatusMessages
-	if throttleHttp := this.migrationContext.GetThrottleHTTP(); strings.Contains(throttleHttp, frenoMagicHint) {
+	if throttleHttp := thlr.migrationContext.GetThrottleHTTP(); strings.Contains(throttleHttp, frenoMagicHint) {
 		statusCodesMap = httpStatusFrenoMessages
 	}
 	if message, ok := statusCodesMap[statusCode]; ok {
@@ -71,33 +86,31 @@ func (this *Throttler) throttleHttpMessage(statusCode int) string {
 // shouldThrottle performs checks to see whether we should currently be throttling.
 // It merely observes the metrics collected by other components, it does not issue
 // its own metric collection.
-func (this *Throttler) shouldThrottle() (result bool, reason string, reasonHint base.ThrottleReasonHint) {
-	if hibernateUntil := atomic.LoadInt64(&this.migrationContext.HibernateUntil); hibernateUntil > 0 {
+func (thlr *Throttler) shouldThrottle() (result bool, reason string, reasonHint base.ThrottleReasonHint) {
+	if hibernateUntil := atomic.LoadInt64(&thlr.migrationContext.HibernateUntil); hibernateUntil > 0 {
 		hibernateUntilTime := time.Unix(0, hibernateUntil)
 		return true, fmt.Sprintf("critical-load-hibernate until %+v", hibernateUntilTime), base.NoThrottleReasonHint
 	}
-	generalCheckResult := this.migrationContext.GetThrottleGeneralCheckResult()
+	generalCheckResult := thlr.migrationContext.GetThrottleGeneralCheckResult()
 	if generalCheckResult.ShouldThrottle {
 		return generalCheckResult.ShouldThrottle, generalCheckResult.Reason, generalCheckResult.ReasonHint
 	}
 	// HTTP throttle
-	statusCode := atomic.LoadInt64(&this.migrationContext.ThrottleHTTPStatusCode)
+	statusCode := atomic.LoadInt64(&thlr.migrationContext.ThrottleHTTPStatusCode)
 	if statusCode != 0 && statusCode != http.StatusOK {
-		return true, this.throttleHttpMessage(int(statusCode)), base.NoThrottleReasonHint
+		return true, thlr.throttleHttpMessage(int(statusCode)), base.NoThrottleReasonHint
 	}
 
 	// Replication lag throttle
-	maxLagMillisecondsThrottleThreshold := atomic.LoadInt64(&this.migrationContext.MaxLagMillisecondsThrottleThreshold)
-	lag := atomic.LoadInt64(&this.migrationContext.CurrentLag)
+	maxLagMillisecondsThrottleThreshold := atomic.LoadInt64(&thlr.migrationContext.MaxLagMillisecondsThrottleThreshold)
+	lag := atomic.LoadInt64(&thlr.migrationContext.CurrentLag)
 	if time.Duration(lag) > time.Duration(maxLagMillisecondsThrottleThreshold)*time.Millisecond {
 		return true, fmt.Sprintf("lag=%fs", time.Duration(lag).Seconds()), base.NoThrottleReasonHint
 	}
-	checkThrottleControlReplicas := true
-	if (this.migrationContext.TestOnReplica || this.migrationContext.MigrateOnReplica) && (atomic.LoadInt64(&this.migrationContext.AllEventsUpToLockProcessedInjectedFlag) > 0) {
-		checkThrottleControlReplicas = false
-	}
+	lockInjected := atomic.LoadInt64(&thlr.migrationContext.AllEventsUpToLockProcessedInjectedFlag) > 0
+	checkThrottleControlReplicas := !lockInjected || (!thlr.migrationContext.TestOnReplica && !thlr.migrationContext.MigrateOnReplica)
 	if checkThrottleControlReplicas {
-		lagResult := this.migrationContext.GetControlReplicasLagResult()
+		lagResult := thlr.migrationContext.GetControlReplicasLagResult()
 		if lagResult.Err != nil {
 			return true, fmt.Sprintf("%+v %+v", lagResult.Key, lagResult.Err), base.NoThrottleReasonHint
 		}
@@ -120,39 +133,39 @@ func parseChangelogHeartbeat(heartbeatValue string) (lag time.Duration, err erro
 }
 
 // parseChangelogHeartbeat parses a string timestamp and deduces replication lag
-func (this *Throttler) parseChangelogHeartbeat(heartbeatValue string) (err error) {
+func (thlr *Throttler) parseChangelogHeartbeat(heartbeatValue string) (err error) {
 	if lag, err := parseChangelogHeartbeat(heartbeatValue); err != nil {
-		return this.migrationContext.Log.Errore(err)
+		return thlr.migrationContext.Log.Errore(err)
 	} else {
-		atomic.StoreInt64(&this.migrationContext.CurrentLag, int64(lag))
+		atomic.StoreInt64(&thlr.migrationContext.CurrentLag, int64(lag))
 		return nil
 	}
 }
 
 // collectReplicationLag reads the latest changelog heartbeat value
-func (this *Throttler) collectReplicationLag(firstThrottlingCollected chan<- bool) {
+func (thlr *Throttler) collectReplicationLag(firstThrottlingCollected chan<- bool) {
 	collectFunc := func() error {
-		if atomic.LoadInt64(&this.migrationContext.CleanupImminentFlag) > 0 {
+		if atomic.LoadInt64(&thlr.migrationContext.CleanupImminentFlag) > 0 {
 			return nil
 		}
-		if atomic.LoadInt64(&this.migrationContext.HibernateUntil) > 0 {
+		if atomic.LoadInt64(&thlr.migrationContext.HibernateUntil) > 0 {
 			return nil
 		}
 
-		if this.migrationContext.TestOnReplica || this.migrationContext.MigrateOnReplica {
+		if thlr.migrationContext.TestOnReplica || thlr.migrationContext.MigrateOnReplica {
 			// when running on replica, the heartbeat injection is also done on the replica.
 			// This means we will always get a good heartbeat value.
 			// When running on replica, we should instead check the `SHOW SLAVE STATUS` output.
-			if lag, err := mysql.GetReplicationLagFromSlaveStatus(this.inspector.informationSchemaDb); err != nil {
-				return this.migrationContext.Log.Errore(err)
+			if lag, err := mysql.GetReplicationLagFromSlaveStatus(thlr.inspector.dbVersion, thlr.inspector.informationSchemaDb); err != nil {
+				return thlr.migrationContext.Log.Errore(err)
 			} else {
-				atomic.StoreInt64(&this.migrationContext.CurrentLag, int64(lag))
+				atomic.StoreInt64(&thlr.migrationContext.CurrentLag, int64(lag))
 			}
 		} else {
-			if heartbeatValue, err := this.inspector.readChangelogState("heartbeat"); err != nil {
-				return this.migrationContext.Log.Errore(err)
+			if heartbeatValue, err := thlr.inspector.readChangelogState("heartbeat"); err != nil {
+				return thlr.migrationContext.Log.Errore(err)
 			} else {
-				this.parseChangelogHeartbeat(heartbeatValue)
+				thlr.parseChangelogHeartbeat(heartbeatValue)
 			}
 		}
 		return nil
@@ -161,36 +174,58 @@ func (this *Throttler) collectReplicationLag(firstThrottlingCollected chan<- boo
 	collectFunc()
 	firstThrottlingCollected <- true
 
-	ticker := time.Tick(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
-	for range ticker {
-		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+	ticker := time.NewTicker(time.Duration(thlr.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if atomic.LoadInt64(&thlr.finishedMigrating) > 0 {
 			return
 		}
 		go collectFunc()
 	}
 }
 
-// collectControlReplicasLag polls all the control replicas to get maximum lag value
-func (this *Throttler) collectControlReplicasLag() {
+// controlReplicaConnectionConfig returns the connection config used to read
+// replication lag from a control replica. In move-tables mode the lag is read
+// from the target cluster's replicas, otherwise from the source (inspector)
+// cluster's replicas.
+func (thlr *Throttler) controlReplicaConnectionConfig(replicaKey mysql.InstanceKey) *mysql.ConnectionConfig {
+	if thlr.migrationContext.IsMoveTablesMode() {
+		return thlr.migrationContext.MoveTables.ConnectionConfig.DuplicateCredentials(replicaKey)
+	}
+	return thlr.migrationContext.InspectorConnectionConfig.DuplicateCredentials(replicaKey)
+}
 
-	if atomic.LoadInt64(&this.migrationContext.HibernateUntil) > 0 {
+// collectControlReplicasLag polls all the control replicas to get maximum lag value
+func (thlr *Throttler) collectControlReplicasLag() {
+	if atomic.LoadInt64(&thlr.migrationContext.HibernateUntil) > 0 {
 		return
 	}
 
-	replicationLagQuery := fmt.Sprintf(`
-		select value from %s.%s where hint = 'heartbeat' and id <= 255
-		`,
-		sql.EscapeName(this.migrationContext.DatabaseName),
-		sql.EscapeName(this.migrationContext.GetChangelogTableName()),
-	)
+	var replicationLagQuery string
+	if !thlr.migrationContext.IsMoveTablesMode() {
+		replicationLagQuery = fmt.Sprintf(`
+			select value from %s.%s where hint = 'heartbeat' and id <= 255
+			`,
+			sql.EscapeName(thlr.migrationContext.DatabaseName),
+			sql.EscapeName(thlr.migrationContext.GetChangelogTableName()),
+		)
+	}
 
 	readReplicaLag := func(connectionConfig *mysql.ConnectionConfig) (lag time.Duration, err error) {
 		dbUri := connectionConfig.GetDBUri("information_schema")
 
 		var heartbeatValue string
-		db, _, err := mysql.GetDB(this.migrationContext.Uuid, dbUri)
+		db, _, err := mysql.GetDB(thlr.migrationContext.Uuid, dbUri)
 		if err != nil {
 			return lag, err
+		}
+
+		if thlr.migrationContext.IsMoveTablesMode() {
+			dbVersion, err := mysql.GetDBVersion(thlr.migrationContext.Uuid, dbUri)
+			if err != nil {
+				return lag, err
+			}
+			return mysql.GetReplicationLagFromSlaveStatus(dbVersion, db)
 		}
 
 		if err := db.QueryRow(replicationLagQuery).Scan(&heartbeatValue); err != nil {
@@ -202,14 +237,17 @@ func (this *Throttler) collectControlReplicasLag() {
 	}
 
 	readControlReplicasLag := func() (result *mysql.ReplicationLagResult) {
-		instanceKeyMap := this.migrationContext.GetThrottleControlReplicaKeys()
+		instanceKeyMap := thlr.migrationContext.GetThrottleControlReplicaKeys()
 		if instanceKeyMap.Len() == 0 {
 			return result
 		}
 		lagResults := make(chan *mysql.ReplicationLagResult, instanceKeyMap.Len())
 		for replicaKey := range *instanceKeyMap {
-			connectionConfig := this.migrationContext.InspectorConnectionConfig.Duplicate()
-			connectionConfig.Key = replicaKey
+			connectionConfig := thlr.controlReplicaConnectionConfig(replicaKey)
+
+			if err := connectionConfig.RegisterTLSConfig(); err != nil {
+				return &mysql.ReplicationLagResult{Err: err}
+			}
 
 			lagResult := &mysql.ReplicationLagResult{Key: connectionConfig.Key}
 			go func() {
@@ -231,26 +269,28 @@ func (this *Throttler) collectControlReplicasLag() {
 	}
 
 	checkControlReplicasLag := func() {
-		if (this.migrationContext.TestOnReplica || this.migrationContext.MigrateOnReplica) && (atomic.LoadInt64(&this.migrationContext.AllEventsUpToLockProcessedInjectedFlag) > 0) {
+		if (thlr.migrationContext.TestOnReplica || thlr.migrationContext.MigrateOnReplica) && (atomic.LoadInt64(&thlr.migrationContext.AllEventsUpToLockProcessedInjectedFlag) > 0) {
 			// No need to read lag
 			return
 		}
-		this.migrationContext.SetControlReplicasLagResult(readControlReplicasLag())
+		thlr.migrationContext.SetControlReplicasLagResult(readControlReplicasLag())
 	}
-	aggressiveTicker := time.Tick(100 * time.Millisecond)
+
 	relaxedFactor := 10
 	counter := 0
 	shouldReadLagAggressively := false
 
-	for range aggressiveTicker {
-		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if atomic.LoadInt64(&thlr.finishedMigrating) > 0 {
 			return
 		}
 		if counter%relaxedFactor == 0 {
 			// we only check if we wish to be aggressive once per second. The parameters for being aggressive
 			// do not typically change at all throughout the migration, but nonetheless we check them.
 			counter = 0
-			maxLagMillisecondsThrottleThreshold := atomic.LoadInt64(&this.migrationContext.MaxLagMillisecondsThrottleThreshold)
+			maxLagMillisecondsThrottleThreshold := atomic.LoadInt64(&thlr.migrationContext.MaxLagMillisecondsThrottleThreshold)
 			shouldReadLagAggressively = (maxLagMillisecondsThrottleThreshold < 1000)
 		}
 		if counter == 0 || shouldReadLagAggressively {
@@ -261,10 +301,10 @@ func (this *Throttler) collectControlReplicasLag() {
 	}
 }
 
-func (this *Throttler) criticalLoadIsMet() (met bool, variableName string, value int64, threshold int64, err error) {
-	criticalLoad := this.migrationContext.GetCriticalLoad()
+func (thlr *Throttler) criticalLoadIsMet() (met bool, variableName string, value int64, threshold int64, err error) {
+	criticalLoad := thlr.migrationContext.GetCriticalLoad()
 	for variableName, threshold = range criticalLoad {
-		value, err = this.applier.ShowStatusVariable(variableName)
+		value, err = thlr.applier.ShowStatusVariable(variableName)
 		if err != nil {
 			return false, variableName, value, threshold, err
 		}
@@ -275,45 +315,59 @@ func (this *Throttler) criticalLoadIsMet() (met bool, variableName string, value
 	return false, variableName, value, threshold, nil
 }
 
-// collectReplicationLag reads the latest changelog heartbeat value
-func (this *Throttler) collectThrottleHTTPStatus(firstThrottlingCollected chan<- bool) {
+// collectThrottleHTTPStatus reads the latest changelog heartbeat value
+func (thlr *Throttler) collectThrottleHTTPStatus(firstThrottlingCollected chan<- bool) {
 	collectFunc := func() (sleep bool, err error) {
-		if atomic.LoadInt64(&this.migrationContext.HibernateUntil) > 0 {
+		if atomic.LoadInt64(&thlr.migrationContext.HibernateUntil) > 0 {
 			return true, nil
 		}
-		url := this.migrationContext.GetThrottleHTTP()
+		url := thlr.migrationContext.GetThrottleHTTP()
 		if url == "" {
 			return true, nil
 		}
-		resp, err := http.Head(url)
+
+		ctx, cancel := context.WithTimeout(context.Background(), thlr.httpClientTimeout)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 		if err != nil {
 			return false, err
 		}
-		atomic.StoreInt64(&this.migrationContext.ThrottleHTTPStatusCode, int64(resp.StatusCode))
+		req.Header.Set("User-Agent", fmt.Sprintf("gh-ost/%s", thlr.appVersion))
+
+		resp, err := thlr.httpClient.Do(req)
+		if err != nil {
+			return false, err
+		}
+		defer resp.Body.Close()
+
+		atomic.StoreInt64(&thlr.migrationContext.ThrottleHTTPStatusCode, int64(resp.StatusCode))
 		return false, nil
 	}
 
 	_, err := collectFunc()
 	if err != nil {
 		// If not told to ignore errors, we'll throttle on HTTP connection issues
-		if !this.migrationContext.IgnoreHTTPErrors {
-			atomic.StoreInt64(&this.migrationContext.ThrottleHTTPStatusCode, int64(-1))
+		if !thlr.migrationContext.IgnoreHTTPErrors {
+			atomic.StoreInt64(&thlr.migrationContext.ThrottleHTTPStatusCode, int64(-1))
 		}
 	}
 
 	firstThrottlingCollected <- true
 
-	ticker := time.Tick(100 * time.Millisecond)
-	for range ticker {
-		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+	collectInterval := time.Duration(thlr.migrationContext.ThrottleHTTPIntervalMillis) * time.Millisecond
+	ticker := time.NewTicker(collectInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if atomic.LoadInt64(&thlr.finishedMigrating) > 0 {
 			return
 		}
 
 		sleep, err := collectFunc()
 		if err != nil {
 			// If not told to ignore errors, we'll throttle on HTTP connection issues
-			if !this.migrationContext.IgnoreHTTPErrors {
-				atomic.StoreInt64(&this.migrationContext.ThrottleHTTPStatusCode, int64(-1))
+			if !thlr.migrationContext.IgnoreHTTPErrors {
+				atomic.StoreInt64(&thlr.migrationContext.ThrottleHTTPStatusCode, int64(-1))
 			}
 		}
 
@@ -323,52 +377,57 @@ func (this *Throttler) collectThrottleHTTPStatus(firstThrottlingCollected chan<-
 	}
 }
 
-// collectGeneralThrottleMetrics reads the once-per-sec metrics, and stores them onto this.migrationContext
-func (this *Throttler) collectGeneralThrottleMetrics() error {
-	if atomic.LoadInt64(&this.migrationContext.HibernateUntil) > 0 {
+// collectGeneralThrottleMetrics reads the once-per-sec metrics, and stores them onto migrationContext
+func (thlr *Throttler) collectGeneralThrottleMetrics() error {
+	if atomic.LoadInt64(&thlr.migrationContext.HibernateUntil) > 0 {
 		return nil
 	}
 
 	setThrottle := func(throttle bool, reason string, reasonHint base.ThrottleReasonHint) error {
-		this.migrationContext.SetThrottleGeneralCheckResult(base.NewThrottleCheckResult(throttle, reason, reasonHint))
+		thlr.migrationContext.SetThrottleGeneralCheckResult(base.NewThrottleCheckResult(throttle, reason, reasonHint))
 		return nil
 	}
 
 	// Regardless of throttle, we take opportunity to check for panic-abort
-	if this.migrationContext.PanicFlagFile != "" {
-		if base.FileExists(this.migrationContext.PanicFlagFile) {
-			this.migrationContext.PanicAbort <- fmt.Errorf("Found panic-file %s. Aborting without cleanup", this.migrationContext.PanicFlagFile)
+	if thlr.migrationContext.PanicFlagFile != "" {
+		if base.FileExists(thlr.migrationContext.PanicFlagFile) {
+			// Use helper to prevent deadlock if listenOnPanicAbort already exited
+			_ = base.SendWithContext(thlr.migrationContext.GetContext(), thlr.migrationContext.PanicAbort, fmt.Errorf("found panic-file %s. Aborting without cleanup", thlr.migrationContext.PanicFlagFile))
+			return nil
 		}
 	}
 
-	criticalLoadMet, variableName, value, threshold, err := this.criticalLoadIsMet()
+	criticalLoadMet, variableName, value, threshold, err := thlr.criticalLoadIsMet()
 	if err != nil {
 		return setThrottle(true, fmt.Sprintf("%s %s", variableName, err), base.NoThrottleReasonHint)
 	}
 
-	if criticalLoadMet && this.migrationContext.CriticalLoadHibernateSeconds > 0 {
-		hibernateDuration := time.Duration(this.migrationContext.CriticalLoadHibernateSeconds) * time.Second
+	if criticalLoadMet && thlr.migrationContext.CriticalLoadHibernateSeconds > 0 {
+		hibernateDuration := time.Duration(thlr.migrationContext.CriticalLoadHibernateSeconds) * time.Second
 		hibernateUntilTime := time.Now().Add(hibernateDuration)
-		atomic.StoreInt64(&this.migrationContext.HibernateUntil, hibernateUntilTime.UnixNano())
-		this.migrationContext.Log.Errorf("critical-load met: %s=%d, >=%d. Will hibernate for the duration of %+v, until %+v", variableName, value, threshold, hibernateDuration, hibernateUntilTime)
+		atomic.StoreInt64(&thlr.migrationContext.HibernateUntil, hibernateUntilTime.UnixNano())
+		thlr.migrationContext.Log.Errorf("critical-load met: %s=%d, >=%d. Will hibernate for the duration of %+v, until %+v", variableName, value, threshold, hibernateDuration, hibernateUntilTime)
 		go func() {
 			time.Sleep(hibernateDuration)
-			this.migrationContext.SetThrottleGeneralCheckResult(base.NewThrottleCheckResult(true, "leaving hibernation", base.LeavingHibernationThrottleReasonHint))
-			atomic.StoreInt64(&this.migrationContext.HibernateUntil, 0)
+			thlr.migrationContext.SetThrottleGeneralCheckResult(base.NewThrottleCheckResult(true, "leaving hibernation", base.LeavingHibernationThrottleReasonHint))
+			atomic.StoreInt64(&thlr.migrationContext.HibernateUntil, 0)
 		}()
 		return nil
 	}
 
-	if criticalLoadMet && this.migrationContext.CriticalLoadIntervalMilliseconds == 0 {
-		this.migrationContext.PanicAbort <- fmt.Errorf("critical-load met: %s=%d, >=%d", variableName, value, threshold)
+	if criticalLoadMet && thlr.migrationContext.CriticalLoadIntervalMilliseconds == 0 {
+		// Use helper to prevent deadlock if listenOnPanicAbort already exited
+		_ = base.SendWithContext(thlr.migrationContext.GetContext(), thlr.migrationContext.PanicAbort, fmt.Errorf("critical-load met: %s=%d, >=%d", variableName, value, threshold))
+		return nil
 	}
-	if criticalLoadMet && this.migrationContext.CriticalLoadIntervalMilliseconds > 0 {
-		this.migrationContext.Log.Errorf("critical-load met once: %s=%d, >=%d. Will check again in %d millis", variableName, value, threshold, this.migrationContext.CriticalLoadIntervalMilliseconds)
+	if criticalLoadMet && thlr.migrationContext.CriticalLoadIntervalMilliseconds > 0 {
+		thlr.migrationContext.Log.Errorf("critical-load met once: %s=%d, >=%d. Will check again in %d millis", variableName, value, threshold, thlr.migrationContext.CriticalLoadIntervalMilliseconds)
 		go func() {
-			timer := time.NewTimer(time.Millisecond * time.Duration(this.migrationContext.CriticalLoadIntervalMilliseconds))
+			timer := time.NewTimer(time.Millisecond * time.Duration(thlr.migrationContext.CriticalLoadIntervalMilliseconds))
 			<-timer.C
-			if criticalLoadMetAgain, variableName, value, threshold, _ := this.criticalLoadIsMet(); criticalLoadMetAgain {
-				this.migrationContext.PanicAbort <- fmt.Errorf("critical-load met again after %d millis: %s=%d, >=%d", this.migrationContext.CriticalLoadIntervalMilliseconds, variableName, value, threshold)
+			if criticalLoadMetAgain, variableName, value, threshold, _ := thlr.criticalLoadIsMet(); criticalLoadMetAgain {
+				// Use helper to prevent deadlock if listenOnPanicAbort already exited
+				_ = base.SendWithContext(thlr.migrationContext.GetContext(), thlr.migrationContext.PanicAbort, fmt.Errorf("critical-load met again after %d millis: %s=%d, >=%d", thlr.migrationContext.CriticalLoadIntervalMilliseconds, variableName, value, threshold))
 			}
 		}()
 	}
@@ -376,25 +435,25 @@ func (this *Throttler) collectGeneralThrottleMetrics() error {
 	// Back to throttle considerations
 
 	// User-based throttle
-	if atomic.LoadInt64(&this.migrationContext.ThrottleCommandedByUser) > 0 {
+	if atomic.LoadInt64(&thlr.migrationContext.ThrottleCommandedByUser) > 0 {
 		return setThrottle(true, "commanded by user", base.UserCommandThrottleReasonHint)
 	}
-	if this.migrationContext.ThrottleFlagFile != "" {
-		if base.FileExists(this.migrationContext.ThrottleFlagFile) {
+	if thlr.migrationContext.ThrottleFlagFile != "" {
+		if base.FileExists(thlr.migrationContext.ThrottleFlagFile) {
 			// Throttle file defined and exists!
 			return setThrottle(true, "flag-file", base.NoThrottleReasonHint)
 		}
 	}
-	if this.migrationContext.ThrottleAdditionalFlagFile != "" {
-		if base.FileExists(this.migrationContext.ThrottleAdditionalFlagFile) {
+	if thlr.migrationContext.ThrottleAdditionalFlagFile != "" {
+		if base.FileExists(thlr.migrationContext.ThrottleAdditionalFlagFile) {
 			// 2nd Throttle file defined and exists!
 			return setThrottle(true, "flag-file", base.NoThrottleReasonHint)
 		}
 	}
 
-	maxLoad := this.migrationContext.GetMaxLoad()
+	maxLoad := thlr.migrationContext.GetMaxLoad()
 	for variableName, threshold := range maxLoad {
-		value, err := this.applier.ShowStatusVariable(variableName)
+		value, err := thlr.applier.ShowStatusVariable(variableName)
 		if err != nil {
 			return setThrottle(true, fmt.Sprintf("%s %s", variableName, err), base.NoThrottleReasonHint)
 		}
@@ -402,8 +461,8 @@ func (this *Throttler) collectGeneralThrottleMetrics() error {
 			return setThrottle(true, fmt.Sprintf("max-load %s=%d >= %d", variableName, value, threshold), base.NoThrottleReasonHint)
 		}
 	}
-	if this.migrationContext.GetThrottleQuery() != "" {
-		if res, _ := this.applier.ExecuteThrottleQuery(); res > 0 {
+	if thlr.migrationContext.GetThrottleQuery() != "" {
+		if res, _ := thlr.applier.ExecuteThrottleQuery(); res > 0 {
 			return setThrottle(true, "throttle-query", base.NoThrottleReasonHint)
 		}
 	}
@@ -411,76 +470,121 @@ func (this *Throttler) collectGeneralThrottleMetrics() error {
 	return setThrottle(false, "", base.NoThrottleReasonHint)
 }
 
-// initiateThrottlerMetrics initiates the various processes that collect measurements
+// initiateThrottlerCollection initiates the various processes that collect measurements
 // that may affect throttling. There are several components, all running independently,
 // that collect such metrics.
-func (this *Throttler) initiateThrottlerCollection(firstThrottlingCollected chan<- bool) {
-	go this.collectReplicationLag(firstThrottlingCollected)
-	go this.collectControlReplicasLag()
-	go this.collectThrottleHTTPStatus(firstThrottlingCollected)
+func (thlr *Throttler) initiateThrottlerCollection(firstThrottlingCollected chan<- bool) {
+	if !thlr.migrationContext.IsMoveTablesMode() {
+		go thlr.collectReplicationLag(firstThrottlingCollected)
+	}
+	go thlr.collectControlReplicasLag()
+	go thlr.collectThrottleHTTPStatus(firstThrottlingCollected)
 
 	go func() {
-		this.collectGeneralThrottleMetrics()
+		thlr.collectGeneralThrottleMetrics()
 		firstThrottlingCollected <- true
 
-		throttlerMetricsTick := time.Tick(1 * time.Second)
-		for range throttlerMetricsTick {
-			if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if atomic.LoadInt64(&thlr.finishedMigrating) > 0 {
 				return
 			}
 
-			this.collectGeneralThrottleMetrics()
+			thlr.collectGeneralThrottleMetrics()
 		}
 	}()
 }
 
-// initiateThrottlerChecks initiates the throttle ticker and sets the basic behavior of throttling.
-func (this *Throttler) initiateThrottlerChecks() error {
-	throttlerTick := time.Tick(100 * time.Millisecond)
+func (thlr *Throttler) recordThrottleMetrics(alreadyThrottling bool, shouldThrottle bool, throttleReason string, now time.Time) {
+	throttleStateChanged := shouldThrottle != alreadyThrottling
+	shouldEmitActiveGauge := throttleStateChanged ||
+		thlr.throttleActiveEmitted.IsZero() ||
+		now.Sub(thlr.throttleActiveEmitted) >= throttleActiveMetricInterval
+	if shouldEmitActiveGauge {
+		metrics.EmitThrottleActiveGauge(thlr.migrationContext.Metrics, shouldThrottle)
+		thlr.throttleActiveEmitted = now
+	}
 
+	if shouldThrottle && !alreadyThrottling {
+		thlr.throttleStartedAt = now
+		thlr.throttleStartedReason = throttleReason
+		return
+	}
+	if alreadyThrottling && !shouldThrottle && !thlr.throttleStartedAt.IsZero() {
+		metrics.EmitThrottleInterval(
+			thlr.migrationContext.Metrics,
+			now.Sub(thlr.throttleStartedAt),
+			thlr.throttleStartedReason,
+		)
+		thlr.throttleStartedAt = time.Time{}
+		thlr.throttleStartedReason = ""
+	}
+}
+
+// initiateThrottlerChecks initiates the throttle ticker and sets the basic behavior of throttling.
+func (thlr *Throttler) initiateThrottlerChecks() {
 	throttlerFunction := func() {
-		alreadyThrottling, currentReason, _ := this.migrationContext.IsThrottled()
-		shouldThrottle, throttleReason, throttleReasonHint := this.shouldThrottle()
+		alreadyThrottling, currentReason, _ := thlr.migrationContext.IsThrottled()
+		shouldThrottle, throttleReason, throttleReasonHint := thlr.shouldThrottle()
 		if shouldThrottle && !alreadyThrottling {
 			// New throttling
-			this.applier.WriteAndLogChangelog("throttle", throttleReason)
+			thlr.applier.WriteAndLogChangelog("throttle", throttleReason)
 		} else if shouldThrottle && alreadyThrottling && (currentReason != throttleReason) {
 			// Change of reason
-			this.applier.WriteAndLogChangelog("throttle", throttleReason)
+			thlr.applier.WriteAndLogChangelog("throttle", throttleReason)
 		} else if alreadyThrottling && !shouldThrottle {
 			// End of throttling
-			this.applier.WriteAndLogChangelog("throttle", "done throttling")
+			thlr.applier.WriteAndLogChangelog("throttle", "done throttling")
 		}
-		this.migrationContext.SetThrottled(shouldThrottle, throttleReason, throttleReasonHint)
+		thlr.recordThrottleMetrics(alreadyThrottling, shouldThrottle, throttleReason, time.Now())
+		thlr.migrationContext.SetThrottled(shouldThrottle, throttleReason, throttleReasonHint)
 	}
 	throttlerFunction()
-	for range throttlerTick {
-		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
-			return nil
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		// Check for context cancellation each iteration
+		ctx := thlr.migrationContext.GetContext()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Process throttle check
+		}
+
+		if atomic.LoadInt64(&thlr.finishedMigrating) > 0 {
+			return
 		}
 		throttlerFunction()
 	}
-
-	return nil
 }
 
 // throttle sees if throttling needs take place, and if so, continuously sleeps (blocks)
 // until throttling reasons are gone
-func (this *Throttler) throttle(onThrottled func()) {
+func (thlr *Throttler) throttle(onThrottled func()) {
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
 	for {
 		// IsThrottled() is non-blocking; the throttling decision making takes place asynchronously.
 		// Therefore calling IsThrottled() is cheap
-		if shouldThrottle, _, _ := this.migrationContext.IsThrottled(); !shouldThrottle {
+		if shouldThrottle, _, _ := thlr.migrationContext.IsThrottled(); !shouldThrottle {
 			return
 		}
 		if onThrottled != nil {
 			onThrottled()
 		}
-		time.Sleep(250 * time.Millisecond)
+		timer.Reset(250 * time.Millisecond)
+		select {
+		case <-thlr.migrationContext.GetContext().Done():
+			return
+		case <-timer.C:
+		}
 	}
 }
 
-func (this *Throttler) Teardown() {
-	this.migrationContext.Log.Debugf("Tearing down...")
-	atomic.StoreInt64(&this.finishedMigrating, 1)
+func (thlr *Throttler) Teardown() {
+	thlr.migrationContext.Log.Debugf("Tearing down...")
+	atomic.StoreInt64(&thlr.finishedMigrating, 1)
 }

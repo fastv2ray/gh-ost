@@ -12,19 +12,23 @@ Since `gh-ost` is not based on triggers, but of reading binary logs, it controls
 
 `gh-ost` supports various means for controlling throttling behavior; it is operations friendly in that it allows the user greater, dynamic control of throttler behavior.
 
+The changelog/heartbeat and source-master descriptions above apply to standard OSC. Cross-cluster moves monitor the target instead; see [move-tables mode](#move-tables-mode).
+
 ### Throttling parameters and factors
 
 Throttling is controlled via the following explicit and implicit factors:
 
 #### Replication-lag
 
-The recommended way of running `gh-ost` is by connecting it to a replica. It will figure out the master by traversing the topology. It is by design that `gh-ost` is throttle aware: it generates its own _heartbeat_ mechanism; while it is running the migration, it is self-checking the replica to which it is connected for replication lag.
+For standard OSC, the recommended way of running `gh-ost` is by connecting it to a replica. It will figure out the master by traversing the topology. It is by design that `gh-ost` is throttle aware: it generates its own _heartbeat_ mechanism; while it is running the migration, it is self-checking the replica to which it is connected for replication lag.
 
 Otherwise you may specify your own list of replica servers you wish it to observe.
 
 - `--throttle-control-replicas`: list of replicas you explicitly wish `gh-ost` to check for replication lag.
 
   Example: `--throttle-control-replicas=myhost1.com:3306,myhost2.com,myhost3.com:3307`
+
+  Note that these must be replicas within the migrated table's replication chain. `gh-ost` does not verify that the hosts in the list are part of it, so unrelated hosts will report healthy lag while your real replicas go unmonitored.
 
 - `--max-lag-millis`: maximum allowed lag; any controlled replica lagging more than this value will cause throttling to kick in. When all control replicas have smaller lag than indicated, operation resumes.
 
@@ -38,7 +42,7 @@ Note that you may dynamically change both `--max-lag-millis` and the `throttle-c
 
   `--max-load='Threads_running=100,Threads_connected=500'`
 
-  Metrics must be valid, numeric [status variables](http://dev.mysql.com/doc/refman/5.6/en/server-status-variables.html)
+  Metrics must be valid, numeric [status variables](https://dev.mysql.com/doc/refman/5.7/en/server-status-variables.html)
 
 #### Throttle query
 
@@ -89,18 +93,28 @@ The first check to suggest throttling stops the check; the status message will n
 The throttle status is printed as part of the periodic [status message](understanding-output.md):
 
 ```
-Copy: 0/2915 0.0%; Applied: 0; Backlog: 0/100; Elapsed: 41s(copy), 41s(total); streamer: mysql-bin.000551:47983; ETA: throttled, flag-file
-Copy: 0/2915 0.0%; Applied: 0; Backlog: 0/100; Elapsed: 42s(copy), 42s(total); streamer: mysql-bin.000551:49370; ETA: throttled, commanded by user
+Copy: 0/2915 0.0%; Applied: 0; Backlog: 0/100; Time: 41s(total), 41s(copy); streamer: mysql-bin.000551:47983; Lag: 0.01s, HeartbeatLag: 0.01s, State: throttled, flag-file; ETA: N/A
+Copy: 0/2915 0.0%; Applied: 0; Backlog: 0/100; Time: 42s(total), 42s(copy); streamer: mysql-bin.000551:49370; Lag: 0.01s, HeartbeatLag: 0.01s, State: throttled, commanded by user; ETA: N/A
 ```
 
 ### How long can you throttle for?
 
 Throttling time is limited by the availability of the binary logs. When throttling begins, `gh-ost` suspends reading the binary logs, and expects to resume reading from same binary log where it paused.
 
-Your availability of binary logs is typically determined by the [expire_logs_days](https://dev.mysql.com/doc/refman/5.6/en/server-system-variables.html#sysvar_expire_logs_days) variable. If you have `expire_logs_days = 10` (or check `select @@global.expire_logs_days`), then you should be able to throttle for up to `10` days.
+Your availability of binary logs is typically determined by the [expire_logs_days](https://dev.mysql.com/doc/refman/5.7/en/replication-options-binary-log.html#sysvar_expire_logs_days) variable. If you have `expire_logs_days = 10` (or check `select @@global.expire_logs_days`), then you should be able to throttle for up to `10` days.
 
 Having said that, throttling for so long is far fetching, in that the `gh-ost` process itself must be kept alive during that time; and the amount of binary logs to process once it resumes will potentially take days to replay.
 
 It is worth mentioning that some deployments have external scheduled scripts that purge binary logs, regardless of the `expire_logs_days` configuration. Please verify your own deployment configuration.
 
 To clarify, you only need to keep binary logs on the single server `gh-ost` connects to.
+
+### Move-tables mode
+
+In [`--move-tables`](move-tables.md) mode, `gh-ost` writes to the target primary without a `_ghc` heartbeat table:
+
+- `--max-load`, `--critical-load`, and `--throttle-query` run on the **target primary**.
+- `--throttle-control-replicas` checks **target-cluster replicas** via `SHOW SLAVE STATUS` / `SHOW REPLICA STATUS` (1s resolution, target credentials).
+- The source replica is **not monitored automatically**. Monitor source load and replication health separately, particularly before cut-over.
+- `WriterLag` is a status metric, not an automatic throttle threshold. A zero value and an empty backlog do not prove source-replica catch-up.
+- Releasing the postpone gate suspends throttling for cut-over; prepare before releasing it.
